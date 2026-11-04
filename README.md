@@ -22,8 +22,6 @@ Przed wysłaniem do chmury starsza część długiej rozmowy jest streszczana lo
 - Windows 10 lub 11, PowerShell 5.1 lub nowszy
 - [.NET 10 SDK](https://dotnet.microsoft.com/download)
 - [Ollama](https://ollama.com/download)
-- Zalecana karta NVIDIA. Bez niej modele lokalne działają na procesorze, dużo wolniej.
-- Opcjonalnie klucz [Anthropic API](https://console.anthropic.com), żeby odpowiadał prawdziwy Claude. Bez klucza można testować w trybie symulacji.
 
 Brakujące .NET i Ollamę skrypt instalacyjny może doinstalować przez `winget`.
 
