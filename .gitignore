@@ -1,0 +1,10 @@
+bin/
+obj/
+.vs/
+*.user
+
+# Per-machine choices from "modelpicker setup" (local model fitted to this hardware)
+appsettings.Local.json
+# Per-machine learned answer lengths (numbers and prompt hashes only)
+modelpicker-stats.json
+modelpicker-stats.json.tmp
