@@ -48,9 +48,11 @@ function Get-ErrorText($err) {
 }
 
 # Sends the conversation to the gateway. Returns the local answer, a cloud handoff, or an error.
-function Send-Chat([string]$RouteMode, [Diagnostics.Stopwatch]$Stopwatch) {
+function Send-Chat([string]$RouteMode, [Diagnostics.Stopwatch]$Stopwatch, [string]$HandoffId = $null) {
     $out = @{ Answer = $null; Final = $null; Handoff = $null; Failure = $null; Usage = $null }
-    $body = @{ model = $RouteMode; messages = $history; stream = $true } | ConvertTo-Json -Depth 4
+    $request = @{ model = $RouteMode; messages = $history; stream = $true }
+    if ($HandoffId) { $request.handoff_id = $HandoffId }  # "locally after all": the gateway reuses its analysis
+    $body = $request | ConvertTo-Json -Depth 4
     $waitLabel = "analizuję zadanie"
     try {
         $req = New-Object System.Net.Http.HttpRequestMessage([System.Net.Http.HttpMethod]::Post, "$Url/v1/chat/completions")
@@ -462,19 +464,218 @@ function Show-Compression($Routing) {
     if ($Routing.fallback_used) { Write-Host "[fallback] model lokalny zawiódł, zadanie przekazane do chmury" -ForegroundColor Red }
 }
 
+# ---- Input line: "/" opens the command list, "!" switches to terminal mode (like in Claude Code) ----
+
+$script:ChatCommands = @(
+    @{ Name = "/stats"; Help = "statystyki: model, prędkość, Twoje zużycie i budżet" }
+    @{ Name = "/reset"; Help = "nowa rozmowa (czyści historię)" }
+    @{ Name = "/auto";  Help = "routing automatyczny (domyślnie)" }
+    @{ Name = "/local"; Help = "wymuś model lokalny" }
+    @{ Name = "/cloud"; Help = "wymuś chmurę" }
+    @{ Name = "/help";  Help = "komendy i skróty klawiszowe" }
+    @{ Name = "/exit";  Help = "zakończ (gateway i modele zostaną zwolnione)" }
+)
+$script:InputHistory = New-Object System.Collections.Generic.List[string]
+
+function Get-MatchingCommands([string]$Text) {
+    if (-not $Text.StartsWith("/") -or $Text.Contains(" ")) { return @() }
+    @($script:ChatCommands | Where-Object { $_.Name.StartsWith($Text, [StringComparison]::OrdinalIgnoreCase) })
+}
+
+# A small line editor instead of Read-Host, which cannot react to the first key typed.
+# Returns @{ Kind = "text" | "shell"; Text = ... }.
+function Read-ChatInput([string]$Mode) {
+    if ([Console]::IsInputRedirected) {
+        # Piped input (tests): no key presses to react to, the same prefixes still work.
+        # [Console]::In, not Read-Host: with piped input Read-Host silently skips lines starting with "!".
+        Write-Host "`nTy [$Mode]: " -NoNewline
+        $t = [Console]::In.ReadLine()
+        if ($null -eq $t) { return @{ Kind = "text"; Text = "/exit" } }
+        Write-Host $t
+        $t = $t.TrimStart([char]0xFEFF)  # the UTF-8 input encoding can leave a BOM on the first piped line
+        if ($t.StartsWith("!")) { return @{ Kind = "shell"; Text = $t.Substring(1).Trim() } }
+        return @{ Kind = "text"; Text = $t }
+    }
+
+    Write-Host ""
+    $buf = New-Object System.Text.StringBuilder
+    $pos = 0
+    $shell = $false
+    $selected = 0
+    $historyIndex = $script:InputHistory.Count
+    $prevInputLen = 0
+    $prevMenuLines = 0
+    $top = [Console]::CursorTop
+
+    $render = {
+        param([bool]$Final = $false)
+        $width = [Console]::BufferWidth
+        $prompt = if ($shell) { "! " } else { "Ty [$Mode]: " }
+        $text = $buf.ToString()
+        $shown = $text.Replace("`n", [string][char]0x21B5)  # pasted line breaks, one character each
+        $menu = @(if (-not ($Final -or $shell)) { Get-MatchingCommands $text })
+        if ($selected -ge $menu.Count) { $selected = [Math]::Max(0, $menu.Count - 1) }
+
+        [Console]::SetCursorPosition(0, $top)
+        if ($shell) { Write-Host $prompt -NoNewline -ForegroundColor Yellow } else { Write-Host $prompt -NoNewline }
+        Write-Host $shown -NoNewline -ForegroundColor $(if ($shell) { "Yellow" } else { "White" })
+        $inputLen = $prompt.Length + $shown.Length
+        if ($prevInputLen -gt $inputLen) { Write-Host (" " * ($prevInputLen - $inputLen)) -NoNewline }
+        $rows = [Math]::Floor([Math]::Max($inputLen, $prevInputLen) / $width) + 1
+
+        # The command list under the input; lines left over from a longer list are blanked.
+        $lines = [Math]::Max($menu.Count, $prevMenuLines)
+        for ($i = 0; $i -lt $lines; $i++) {
+            Write-Host ""
+            if ($i -lt $menu.Count) {
+                $line = ("  {0,-8} {1}" -f $menu[$i].Name, $menu[$i].Help)
+                $line = $line.Substring(0, [Math]::Min($line.Length, $width - 1)).PadRight($width - 1)
+                if ($i -eq $selected) { Write-Host $line -NoNewline -ForegroundColor Black -BackgroundColor Cyan }
+                else { Write-Host $line -NoNewline -ForegroundColor DarkGray }
+            } else {
+                Write-Host (" " * ($width - 1)) -NoNewline
+            }
+        }
+        # If the window scrolled while drawing, everything moved up: find the input line again.
+        $top = [Console]::CursorTop - ($rows - 1) - $lines
+        if ($top -lt 0) { $top = 0 }
+        $prevInputLen = $inputLen
+        $prevMenuLines = $menu.Count
+
+        $offset = if ($Final) { $inputLen } else { $prompt.Length + $pos }
+        [Console]::SetCursorPosition($offset % $width, $top + [Math]::Floor($offset / $width))
+    }
+
+    $pending = $null
+    while ($true) {
+        if ($pending) { $key = $pending; $pending = $null }
+        else { . $render; $key = [Console]::ReadKey($true) }
+        $text = $buf.ToString()
+        $menu = @(if (-not $shell) { Get-MatchingCommands $text })
+
+        switch ($key.Key) {
+            "Enter" {
+                # Keys still waiting = a paste of several lines: keep them in one message.
+                if ([Console]::KeyAvailable) { [void]$buf.Insert($pos, "`n"); $pos++; break }
+                $result = $text
+                if ($menu.Count -gt 0 -and -not ($menu | Where-Object { $_.Name -eq $text })) {
+                    $result = $menu[$selected].Name
+                    [void]$buf.Clear().Append($result)  # the line then shows the command that runs
+                }
+                . $render $true
+                Write-Host ""
+                if ($result.Trim()) { $script:InputHistory.Add($(if ($shell) { "!$result" } else { $result })) }
+                return @{ Kind = $(if ($shell) { "shell" } else { "text" }); Text = $result }
+            }
+            "Escape" { [void]$buf.Clear(); $pos = 0; $selected = 0 }
+            "Tab" { if ($menu.Count -gt 0) { [void]$buf.Clear().Append($menu[$selected].Name); $pos = $buf.Length } }
+            "UpArrow" {
+                if ($menu.Count -gt 0) { $selected = ($selected - 1 + $menu.Count) % $menu.Count }
+                elseif ($historyIndex -gt 0) {
+                    $historyIndex--
+                    $h = $script:InputHistory[$historyIndex]
+                    $shell = $h.StartsWith("!")
+                    [void]$buf.Clear().Append($(if ($shell) { $h.Substring(1) } else { $h })); $pos = $buf.Length
+                }
+            }
+            "DownArrow" {
+                if ($menu.Count -gt 0) { $selected = ($selected + 1) % $menu.Count }
+                elseif ($historyIndex -lt $script:InputHistory.Count) {
+                    $historyIndex++
+                    $h = if ($historyIndex -lt $script:InputHistory.Count) { $script:InputHistory[$historyIndex] } else { "" }
+                    $shell = $h.StartsWith("!")
+                    [void]$buf.Clear().Append($(if ($shell) { $h.Substring(1) } else { $h })); $pos = $buf.Length
+                }
+            }
+            "LeftArrow"  { if ($pos -gt 0) { $pos-- } }
+            "RightArrow" { if ($pos -lt $buf.Length) { $pos++ } }
+            "Home"       { $pos = 0 }
+            "End"        { $pos = $buf.Length }
+            "Delete"     { if ($pos -lt $buf.Length) { [void]$buf.Remove($pos, 1) } }
+            "Backspace" {
+                if ($pos -gt 0) { [void]$buf.Remove($pos - 1, 1); $pos--; $selected = 0 }
+                elseif ($shell -and $buf.Length -eq 0) { $shell = $false }  # back to chat, like in Claude Code
+            }
+            default {
+                $c = $key.KeyChar
+                if ([char]::IsControl($c)) { break }
+                if ($c -eq '!' -and $buf.Length -eq 0 -and -not $shell) { $shell = $true; break }
+                [void]$buf.Insert($pos, [string]$c); $pos++; $selected = 0
+                # A paste arrives as many keys at once: take them all before redrawing (redrawing per key is slow).
+                while ([Console]::KeyAvailable) {
+                    $next = [Console]::ReadKey($true)
+                    if (-not [char]::IsControl($next.KeyChar)) { [void]$buf.Insert($pos, [string]$next.KeyChar); $pos++ }
+                    else { $pending = $next; break }  # Enter, arrows...: handled by the main loop
+                }
+            }
+        }
+    }
+}
+
+# "!command": runs in the project folder, output shown live and added to the conversation,
+# so the next question can refer to it ("why does this test fail?").
+function Invoke-ShellCommand([string]$Command) {
+    if (-not $Command.Trim()) { return }
+    $teed = $null
+    $global:LASTEXITCODE = 0  # otherwise an exit code left by an earlier program would be reported
+    Push-Location $ProjectDir
+    try {
+        # "2>&1" inside the expression: outside it would not catch the stderr of programs (git, dotnet...).
+        Invoke-Expression "$Command 2>&1" |
+            ForEach-Object { if ($_ -is [Management.Automation.ErrorRecord]) { $_.Exception.Message } else { $_ } } |
+            Tee-Object -Variable teed | Out-Host
+        $output = ($teed | Out-String -Width 200).TrimEnd()
+        if ($LASTEXITCODE) { Write-Host "(kod wyjścia: $LASTEXITCODE)" -ForegroundColor DarkYellow; $output += "`n(kod wyjścia: $LASTEXITCODE)" }
+    }
+    catch {
+        Write-Host (Get-ErrorText $_) -ForegroundColor Red
+        $output = Get-ErrorText $_
+    }
+    finally { Pop-Location }
+
+    $limit = 6000
+    # The end of a long output (test results, errors) matters most.
+    if ($output.Length -gt $limit) { $output = "[...początek ucięty...]`n" + $output.Substring($output.Length - $limit) }
+    $fence = '```'
+    [void]$history.Add(@{ role = "user"; content = "Uruchomiłem w terminalu (katalog: $ProjectDir):`n> $Command`n`nWynik:`n$fence`n$output`n$fence" })
+    Write-Host "(wynik dodany do kontekstu rozmowy)" -ForegroundColor DarkGray
+}
+
+function Show-Help {
+    Write-Host ""
+    Write-Host "Komendy (wpisz / żeby wybrać z listy):" -ForegroundColor Cyan
+    foreach ($c in $script:ChatCommands) { Write-Host ("  {0,-8} {1}" -f $c.Name, $c.Help) }
+    Write-Host ""
+    Write-Host "Skróty:" -ForegroundColor Cyan
+    Write-Host "  !komenda  tryb terminala: wykonuje komendę w katalogu projektu, wynik trafia do rozmowy"
+    Write-Host "            (Backspace na pustym polu wraca do czatu)"
+    Write-Host "  strzałki  w liście komend: wybór; poza nią: poprzednie wpisy"
+    Write-Host "  Tab       uzupełnia komendę, Esc czyści pole"
+}
+
 # Who the key belongs to: the key itself is a password, so it is never printed.
-$me = try { (Invoke-RestMethod "$Url/stats" -Headers @{ Authorization = "Bearer $Key" } -TimeoutSec 5).me } catch { $null }
+$gatewayUp = $true
+$me = try { (Invoke-RestMethod "$Url/stats" -Headers @{ Authorization = "Bearer $Key" } -TimeoutSec 5).me } catch { $gatewayUp = $false; $null }
 if ($me) {
     $access = if ($me.monthly_cloud_token_budget -gt 0) { "budżet chmury {0:N0} tokenów/mies." -f $me.monthly_cloud_token_budget } else { "bez dostępu do chmury" }
     Write-Host "ModelPicker - użytkownik: $($me.user) ($access)" -ForegroundColor Cyan
+} elseif (-not $gatewayUp) {
+    Write-Host "ModelPicker - gateway nie odpowiada ($Url). Komendy z ! działają, pytania nie." -ForegroundColor Red
 } else {
     Write-Host "ModelPicker - gateway nie zna tego klucza, zapytania zostaną odrzucone (sprawdź Gateway:ApiKeys)." -ForegroundColor Red
 }
 Write-Host "Projekt: $ProjectDir (chmura widzi pliki tego katalogu, tylko do odczytu)" -ForegroundColor DarkCyan
-Write-Host "Komendy: /reset - nowa rozmowa, /stats - statystyki, /local /cloud /auto - wymuś routing, /exit - koniec" -ForegroundColor DarkCyan
+Write-Host "Wpisz / żeby zobaczyć komendy, ! żeby wykonać komendę w terminalu, /help - pomoc" -ForegroundColor DarkCyan
 while ($true) {
-    $q = Read-Host "`nTy [$mode]"
+    $in = Read-ChatInput $mode
+    if ($in.Kind -eq "shell") { Invoke-ShellCommand $in.Text; continue }
+    $q = $in.Text
     if ($q -eq "/exit") { break }
+    if ($q -eq "/help") { Show-Help; continue }
+    if ($q -match '^/\S*$' -and -not ($script:ChatCommands | Where-Object { $_.Name -eq $q })) {
+        Write-Host "Nieznana komenda: $q (wpisz / żeby zobaczyć listę)" -ForegroundColor DarkYellow
+        continue
+    }
     if ($q -eq "/reset") { $history.Clear(); Write-Host "Nowa rozmowa." -ForegroundColor Cyan; continue }
     if ($q -eq "/stats") { Show-Stats; continue }
     if ($q -in "/local", "/cloud", "/auto") { $mode = $q.TrimStart("/"); Write-Host "Tryb routingu: $mode" -ForegroundColor Cyan; continue }
@@ -491,7 +692,7 @@ while ($true) {
             $choice = Select-CloudProvider $res.Handoff
             if ($choice -eq "local") {
                 $sw.Restart()
-                $res = Send-Chat "local" $sw
+                $res = Send-Chat "local" $sw $res.Handoff.id
                 break
             }
             $exe = Resolve-CloudProvider $choice

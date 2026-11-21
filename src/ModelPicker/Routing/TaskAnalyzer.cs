@@ -1,4 +1,5 @@
 using System.Text.Json.Nodes;
+using System.Text.RegularExpressions;
 using System.Text.Json.Serialization;
 using Microsoft.Extensions.Options;
 using ModelPicker.Models;
@@ -15,7 +16,12 @@ public record TaskAnalysis(
     [property: JsonPropertyName("classifier_used")] bool ClassifierUsed,
     [property: JsonPropertyName("expected_length")] string ExpectedLength,
     /// <summary>True when the output estimate comes from measured answers, not the fixed default.</summary>
-    [property: JsonPropertyName("output_estimate_learned")] bool OutputEstimateLearned);
+    [property: JsonPropertyName("output_estimate_learned")] bool OutputEstimateLearned,
+    /// <summary>
+    /// The task is about files or a project on the user's computer that are not in the message.
+    /// The local model cannot read them; only the cloud CLI, which runs in the project folder, can.
+    /// </summary>
+    [property: JsonPropertyName("needs_project_files")] bool NeedsProjectFiles);
 
 /// <summary>
 /// Estimates how big and how hard a task is: token counts from heuristics,
@@ -36,6 +42,10 @@ public class TaskAnalyzer(
         4 = hard (multi-step reasoning, non-trivial algorithms, debugging across files, architecture)
         5 = very hard (research-level reasoning, complex proofs, large system design)
         Estimate the expected answer length: short (< 200 tokens), medium (200-1000), long (> 1000).
+        Set needs_files to true only when answering requires reading files, code or a project on the user's computer
+        that are NOT included in the message, e.g. "describe this project", "what does Program.cs do",
+        "why does my build fail" with no code given. Set it to false for general questions, and when the code or text
+        is pasted in the message.
         Respond only with JSON.
         """;
 
@@ -45,11 +55,30 @@ public class TaskAnalyzer(
           "properties": {
             "difficulty": { "type": "integer", "minimum": 1, "maximum": 5 },
             "category": { "type": "string", "enum": ["chat", "qa", "writing", "code", "analysis", "math", "other"] },
-            "expected_length": { "type": "string", "enum": ["short", "medium", "long"] }
+            "expected_length": { "type": "string", "enum": ["short", "medium", "long"] },
+            "needs_files": { "type": "boolean" }
           },
-          "required": ["difficulty", "category", "expected_length"]
+          "required": ["difficulty", "category", "expected_length", "needs_files"]
         }
         """)!;
+
+    // The small classifier misses plain references such as "describe this project" or "this repository",
+    // so these are also caught by words: "ten/mój/nasz projekt, kod, repo...", "this project...", or a file name.
+    // Polish stems are cut short ("projek", not "projekt") to match declined forms like "w tym projekcie".
+    private static readonly Regex ProjectReference = new(
+        @"\b(ten|tego|tym|temu|tej|ta|naszym|naszego|nasz|nasza|moim|mojego|mój|moj|moja|mojej)\s+" +
+        @"(projek\w*|repo\w*|kod\w*|gateway\w*|aplikacj\w*|program\w*|solucj\w*|katalog\w*|folder\w*|klas\w*|plik\w*)" +
+        @"|\b(this|my|our)\s+(project|repo|repository|codebase|code|app|application|solution|folder|directory|gateway)\b" +
+        @"|\b[\w-]+\.(cs|csproj|sln|ps1|psm1|py|js|ts|tsx|jsx|json|ya?ml|md|xml|config|java|kt|go|rs|cpp|hpp|h)\b" +
+        @"|\b(w|we)\s+(projekcie|repo|repozytorium|kodzie)\b",
+        RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+
+    /// <summary>
+    /// The classifier's flag or a reference by words. Code pasted in the message ("what does this code do? ```...```")
+    /// is in the message itself, so the words alone do not count then.
+    /// </summary>
+    private static bool NeedsProjectFiles(string text, bool classifierSaysSo) =>
+        classifierSaysSo || (!text.Contains("```") && ProjectReference.IsMatch(text));
 
     public async Task<TaskAnalysis> AnalyzeAsync(ChatRequest request, CancellationToken ct)
     {
@@ -59,10 +88,11 @@ public class TaskAnalyzer(
         string category;
         string expectedLength;
         bool classifierUsed;
+        bool needsFiles = false;
+        var lastUserMessage = request.Messages.LastOrDefault(m => m.Role == "user")?.Content ?? "";
         try
         {
-            var lastUser = request.Messages.LastOrDefault(m => m.Role == "user")?.Content ?? "";
-            var excerpt = lastUser.Length > ClassifierPromptChars ? lastUser[..ClassifierPromptChars] + "\n[...]" : lastUser;
+            var excerpt = lastUserMessage.Length > ClassifierPromptChars ? lastUserMessage[..ClassifierPromptChars] + "\n[...]" : lastUserMessage;
             var result = await ollama.ClassifyAsync(ClassifierSystemPrompt, excerpt, Schema, ct)
                 ?? throw new InvalidOperationException("Empty classifier response");
 
@@ -70,6 +100,7 @@ public class TaskAnalyzer(
             difficulty = (int)Math.Clamp(result["difficulty"]!.GetValue<double>(), 1, 5);
             category = result["category"]!.GetValue<string>();
             expectedLength = result["expected_length"]!.GetValue<string>();
+            needsFiles = result["needs_files"]?.GetValue<bool>() ?? false;
             classifierUsed = true;
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
@@ -96,7 +127,8 @@ public class TaskAnalyzer(
             Math.Round(hardware.EstimateSeconds(inputTokens, localOutputTokens), 1),
             classifierUsed,
             expectedLength,
-            learned);
+            learned,
+            NeedsProjectFiles(lastUserMessage, needsFiles));
     }
 
     private static (int Difficulty, string Category, string ExpectedLength) HeuristicGuess(ChatRequest request, int inputTokens)

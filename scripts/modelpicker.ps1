@@ -9,6 +9,7 @@
 #   modelpicker logs             follow the gateway's log (it runs in the background, without a window)
 #   modelpicker setup            scan the hardware and choose the local model (runs automatically on first start)
 #   modelpicker setup -List      only show which models fit this hardware
+#   modelpicker help (-h)        list all commands and the main settings
 #   mp, mp-stop                  short forms of modelpicker and modelpicker-stop (same parameters)
 #
 # Leaving the chat (/exit or Ctrl+C) runs modelpicker-stop automatically.
@@ -111,6 +112,43 @@ function Show-ModelPickerLog {
     Get-Content $script:GatewayLog -Encoding UTF8 -Tail 40 -Wait
 }
 
+function Show-ModelPickerHelp {
+    $c = "Cyan"; $g = "DarkGray"
+    Write-Host ""
+    Write-Host "ModelPicker - komendy w terminalu (mp = modelpicker)" -ForegroundColor $c
+    @(
+        @("mp", "start: gateway w tle + czat w bieżącym folderze (projekcie)"),
+        @("mp -Restart", "restart gatewaya, np. po zmianie kodu albo ustawień"),
+        @("mp -KeepRunning", "po wyjściu z czatu modele zostają w pamięci (szybszy następny start)"),
+        @("mp -Key <klucz>", "czat jako inny użytkownik (klucze w appsettings.json)"),
+        @("mp setup", "skan sprzętu i wybór modelu lokalnego"),
+        @("mp setup -List", "tylko pokaż, które modele pasują do tego sprzętu"),
+        @("mp logs", "podgląd logu gatewaya na żywo"),
+        @("mp-stop", "zatrzymaj gateway i zwolnij modele z RAM/VRAM"),
+        @("mp help", "ta lista")
+    ) | ForEach-Object { Write-Host ("  {0,-18}" -f $_[0]) -NoNewline -ForegroundColor White; Write-Host $_[1] -ForegroundColor $g }
+
+    Write-Host ""
+    Write-Host "W czacie" -ForegroundColor $c
+    Write-Host "  /           lista komend czatu (/stats, /reset, /local, /cloud, /auto, /help, /exit)" -ForegroundColor $g
+    Write-Host "  !komenda    tryb terminala w folderze projektu, wynik trafia do rozmowy" -ForegroundColor $g
+
+    Write-Host ""
+    Write-Host "Ustawienia (po zmianie: mp -Restart)" -ForegroundColor $c
+    Write-Host "  $(Join-Path $script:ModelPickerProject 'appsettings.json'), sekcja Gateway:" -ForegroundColor $g
+    @(
+        @("Routing:MaxLocalLatencySeconds", "ile sekund wolno czekać na model lokalny, zanim zadanie pójdzie do chmury (30)"),
+        @("Routing:CloudDifficultyThreshold", "od jakiej trudności (1-5) zadanie idzie do chmury (4)"),
+        @("Ollama:ContextWindow", "kontekst modelu lokalnego w tokenach (8192)"),
+        @("Ollama:KeepAlive", "jak długo Ollama trzyma model w pamięci (30m)"),
+        @("Ollama:Think", "tryb myślenia modelu lokalnego: dokładniej, ale wolniej (false)"),
+        @("Cloud:Providers", "providerzy chmury do wyboru (claude, codex)"),
+        @("Compression:Enabled", "streszczanie długiej rozmowy przed wysłaniem do chmury (true)")
+    ) | ForEach-Object { Write-Host ("  {0,-34}" -f $_[0]) -NoNewline -ForegroundColor White; Write-Host $_[1] -ForegroundColor $g }
+    Write-Host "  Model lokalny wybrany przez mp setup jest w appsettings.Local.json." -ForegroundColor $g
+    Write-Host ""
+}
+
 function Test-OllamaUp {
     try { Invoke-RestMethod "$script:OllamaUrl/api/version" -TimeoutSec 5 | Out-Null; $true } catch { $false }
 }
@@ -133,9 +171,14 @@ function Get-ModelPickerSetupProblem {
     $null
 }
 
+function Get-ModelPickerLocalModel {
+    try { (Get-Content (Join-Path $script:ModelPickerProject "appsettings.Local.json") -Raw -Encoding UTF8 -ErrorAction Stop | ConvertFrom-Json).Gateway.Ollama.Model } catch { $null }
+}
+
 function Invoke-ModelPickerSetup([switch]$List) {
-    # The gateway locks its build output and must reload the model anyway.
-    if (-not $List -and (Stop-ModelPickerGateway)) { Write-Host "Gateway zatrzymany na czas konfiguracji." -ForegroundColor DarkGray }
+    # A running gateway is left alone: a chat in another window keeps working if the setup is cancelled.
+    # It is restarted only when a new model was actually chosen (it reads the model at startup).
+    $modelBefore = Get-ModelPickerLocalModel
     # Build first with an animation (dotnet run would otherwise sit silent for a few seconds).
     $log = Join-Path $env:TEMP "modelpicker-build.log"
     # -tl:off: the MSBuild terminal logger draws live progress straight to the console, bypassing the redirect.
@@ -168,6 +211,12 @@ function Invoke-ModelPickerSetup([switch]$List) {
     if ($List) { $setupArgs += "--list" }
     Push-Location $script:ModelPickerProject
     try { & dotnet @setupArgs } finally { Pop-Location }
+
+    $modelAfter = Get-ModelPickerLocalModel
+    if (-not $List -and $modelAfter -and $modelAfter -ne $modelBefore -and (Test-ModelPickerUp)) {
+        Stop-ModelPickerGateway | Out-Null
+        Write-Host "Gateway działał na poprzednim modelu ($modelBefore) - zatrzymany. Uruchom mp, żeby wczytał $modelAfter." -ForegroundColor Yellow
+    }
 }
 
 function modelpicker {
@@ -176,12 +225,14 @@ function modelpicker {
         [switch]$List,
         [string]$Key = "dev-key-jan",
         [switch]$Restart,
-        [switch]$KeepRunning
+        [switch]$KeepRunning,
+        [Alias("h")][switch]$Help
     )
 
+    if ($Help -or $Command -in "help", "/?", "?", "--help") { Show-ModelPickerHelp; return }
     if ($Command -eq "setup") { Invoke-ModelPickerSetup -List:$List; return }
     if ($Command -eq "logs") { Show-ModelPickerLog; return }
-    if ($Command) { Write-Host "Nieznana komenda: $Command. Dostępne: modelpicker setup [-List], modelpicker logs" -ForegroundColor Red; return }
+    if ($Command) { Write-Host "Nieznana komenda: $Command. Wszystkie komendy: mp help" -ForegroundColor Red; return }
 
     # 0. Prerequisites
     if (-not (Get-Command dotnet -ErrorAction SilentlyContinue)) {
@@ -266,8 +317,7 @@ function modelpicker {
     Write-Host ""
     Write-Host "Zadania wycenione na chmurę zapytają o providera: Claude Code (claude) albo Codex (codex)." -ForegroundColor Yellow
     Write-Host "Używany jest Twój login w danym CLI; jeśli go nie ma, pojawi się ekran logowania." -ForegroundColor DarkGray
-    Write-Host "  -KeepRunning nie zwalnia pamięci po wyjściu; modelpicker-stop sprząta ręcznie" -ForegroundColor DarkGray
-    Write-Host "  Gateway działa w tle bez okna; jego log: modelpicker logs (w drugim oknie)" -ForegroundColor DarkGray
+    Write-Host "  Wszystkie komendy i ustawienia: mp help (w drugim oknie), w czacie: /help" -ForegroundColor DarkGray
     Write-Host ""
 
     # 4. Chat; cleanup runs on /exit and on Ctrl+C.

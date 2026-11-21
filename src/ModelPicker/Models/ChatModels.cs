@@ -1,4 +1,4 @@
-using System.Text.Json.Serialization;
+﻿using System.Text.Json.Serialization;
 
 namespace ModelPicker.Models;
 
@@ -17,6 +17,12 @@ public record ChatRequest
     [JsonPropertyName("temperature")] public double? Temperature { get; init; }
     /// <summary>Server-sent events; the first event carries the routing decision, before the answer is ready.</summary>
     [JsonPropertyName("stream")] public bool? Stream { get; init; }
+    /// <summary>
+    /// The id of a cloud handoff this request follows, e.g. when the user chose to run the task locally after all:
+    /// the gateway reuses that analysis instead of classifying again (which costs time and may file the task
+    /// under another expected length, so the answer would teach the wrong length statistics).
+    /// </summary>
+    [JsonPropertyName("handoff_id")] public string? HandoffId { get; init; }
 }
 
 public record ChatChoice(

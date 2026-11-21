@@ -76,58 +76,89 @@ public static class SetupWizard
             (n > 0, n > 0 ? $"pasujące: {n}, zalecany: {recommended?.Name}" : "żaden model nie zmieści się na tym sprzęcie"));
 
         // 3. List
-        Console.WriteLine();
-        Console.WriteLine($"Modele lokalne (kontekst {gateway.Ollama.ContextWindow} tokenów):");
-        Console.WriteLine($"  {"#",2}  {"Model",-16} {"Rozmiar",8}  {"Potrzeba",8}  {"Gdzie działa",-24} Status");
-        for (int i = 0; i < usable.Count; i++)
+        var rows = usable.Select((o, i) =>
         {
-            var o = usable[i];
             var where = o.Fit == ModelFit.Gpu ? "cały na GPU - szybko" : "część na CPU - wolno";
             var status = new List<string>();
             if (o == recommended) status.Add("★ ZALECANY");
             if (o.Name == gateway.Ollama.Model) status.Add("obecnie używany");
             status.Add(o.Installed ? "zainstalowany" : "do pobrania");
-
-            Console.ForegroundColor = o == recommended ? ConsoleColor.Green : o.Fit == ModelFit.Gpu ? ConsoleColor.Gray : ConsoleColor.DarkYellow;
-            Console.WriteLine($"  {i + 1,2}  {o.Name,-16} {Gb(o.SizeGb),8}  {Gb(o.NeededGb),8}  {where,-24} {string.Join(", ", status)}");
-            Console.ResetColor();
-            if (Animated) await Task.Delay(70); // rows appear one by one
-        }
+            var color = o == recommended ? ConsoleColor.Green : o.Fit == ModelFit.Gpu ? ConsoleColor.Gray : ConsoleColor.DarkYellow;
+            return (Text: $"{i + 1,2}  {o.Name,-16} {Gb(o.SizeGb),8}  {Gb(o.NeededGb),8}  {where,-24} {string.Join(", ", status)}", Color: color);
+        }).ToList();
+        var columns = $"{"#",2}  {"Model",-16} {"Rozmiar",8}  {"Potrzeba",8}  {"Gdzie działa",-24} Status";
+        var notes = new List<string>();
         if (tooLarge.Count > 0)
-        {
-            Console.ForegroundColor = ConsoleColor.DarkGray;
-            Console.WriteLine($"  Pominięte - przekraczają możliwości sprzętu: {string.Join(", ", tooLarge.Select(o => $"{o.Name} ({Gb(o.SizeGb)})"))}");
-            Console.ResetColor();
-        }
-        Console.WriteLine("  \"Potrzeba\" = model + pamięć na kontekst (szacunek).");
+            notes.Add($"  Pominięte - przekraczają możliwości sprzętu: {string.Join(", ", tooLarge.Select(o => $"{o.Name} ({Gb(o.SizeGb)})"))}");
+        notes.Add("  \"Potrzeba\" = model + pamięć na kontekst (szacunek).");
 
+        Console.WriteLine();
+        Console.WriteLine($"Modele lokalne (kontekst {gateway.Ollama.ContextWindow} tokenów):");
+        bool menu = !listOnly && usable.Count > 0 && ConsoleMenu.Available;
+        if (!menu)
+        {
+            Console.WriteLine("  " + columns);
+            foreach (var row in rows)
+            {
+                Console.ForegroundColor = row.Color;
+                Console.WriteLine("  " + row.Text);
+                Console.ResetColor();
+                if (Animated) await Task.Delay(70); // rows appear one by one
+            }
+            WriteNotes(notes);
+        }
         if (listOnly || usable.Count == 0) return 0;
 
         // 4. Choice
-        int defaultIndex = recommended is null ? 1 : usable.IndexOf(recommended) + 1;
-        Console.Write($"\nWybierz numer modelu [Enter = {defaultIndex}, q = anuluj]: ");
-        var input = ReadAnswer();
-        if (input is null || input.Equals("q", StringComparison.OrdinalIgnoreCase))
+        int defaultIndex = recommended is null ? 0 : usable.IndexOf(recommended);
+        int choice;
+        if (menu)
         {
-            Console.WriteLine("Anulowano - konfiguracja bez zmian.");
+            // The menu draws the rows itself and redraws them in place, so the notes go above it.
+            WriteNotes(notes);
+            Console.ForegroundColor = ConsoleColor.DarkGray;
+            Console.WriteLine("  " + ConsoleMenu.Hint);
+            Console.ResetColor();
+            Console.WriteLine("    " + columns);
+            choice = ConsoleMenu.Select(rows, defaultIndex);
+        }
+        else
+        {
+            Console.Write($"\nWybierz numer modelu [Enter = {defaultIndex + 1}, q = anuluj]: ");
+            var input = ReadAnswer();
+            choice = input is null || input.Equals("q", StringComparison.OrdinalIgnoreCase) ? -1
+                : input.Length == 0 ? defaultIndex
+                : int.TryParse(input, out var n) && n >= 1 && n <= usable.Count ? n - 1
+                : -2;
+        }
+        if (choice < 0)
+        {
+            Console.WriteLine(choice == -1
+                ? $"Anulowano - konfiguracja bez zmian (model lokalny: {gateway.Ollama.Model})."
+                : "Nieprawidłowy numer - konfiguracja bez zmian.");
             return 1;
         }
-        int choice = input.Length == 0 ? defaultIndex : int.TryParse(input, out var n) ? n : -1;
-        if (choice < 1 || choice > usable.Count)
-        {
-            Console.WriteLine("Nieprawidłowy numer - konfiguracja bez zmian.");
-            return 1;
-        }
-        var chosen = usable[choice - 1];
+        var chosen = usable[choice];
 
         // 5. Pull if needed
         if (!chosen.Installed)
         {
-            Console.Write($"Pobrać {chosen.Name} (~{Gb(chosen.SizeGb)})? [T/n]: ");
-            var confirm = ReadAnswer();
-            if (confirm is null || confirm.Equals("n", StringComparison.OrdinalIgnoreCase))
+            bool pull;
+            if (ConsoleMenu.Available)
             {
-                Console.WriteLine("Anulowano - konfiguracja bez zmian.");
+                Console.WriteLine($"\n{chosen.Name} nie jest jeszcze pobrany.");
+                pull = ConsoleMenu.Select(
+                    [($"Pobierz teraz (~{Gb(chosen.SizeGb)})", ConsoleColor.White), ("Anuluj", ConsoleColor.White)], 0) == 0;
+            }
+            else
+            {
+                Console.Write($"Pobrać {chosen.Name} (~{Gb(chosen.SizeGb)})? [T/n]: ");
+                var confirm = ReadAnswer();
+                pull = confirm is not null && !confirm.Equals("n", StringComparison.OrdinalIgnoreCase);
+            }
+            if (!pull)
+            {
+                Console.WriteLine($"Anulowano - konfiguracja bez zmian (model lokalny: {gateway.Ollama.Model}).");
                 return 1;
             }
             if (!await PullAsync(http, chosen.Name)) return 1;
@@ -416,6 +447,13 @@ public static class SetupWizard
     // Polish plural: 1 model, 2-4 modele (but 12-14 modeli), 5+ modeli.
     private static string ModelsWord(int n) =>
         n == 1 ? "model" : n % 10 is >= 2 and <= 4 && n % 100 is not (>= 12 and <= 14) ? "modele" : "modeli";
+
+    private static void WriteNotes(IEnumerable<string> notes)
+    {
+        Console.ForegroundColor = ConsoleColor.DarkGray;
+        foreach (var note in notes) Console.WriteLine(note);
+        Console.ResetColor();
+    }
 
     // Input piped from PowerShell can start with a byte order mark.
     private static string? ReadAnswer() => Console.ReadLine()?.Trim().TrimStart('﻿');

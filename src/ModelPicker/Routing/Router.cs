@@ -21,6 +21,8 @@ public class Router(IOptions<GatewayOptions> options, UsageTracker usage)
         {
             "local" => new RoutingDecision(Target.Local, "forced by client"),
             "cloud" => new RoutingDecision(Target.Cloud, "forced by client"),
+            _ when a.NeedsProjectFiles =>
+                new(Target.Cloud, "needs the project's files (only the cloud CLI can read them)"),
             _ when totalTokens > _opt.Ollama.ContextWindow =>
                 new(Target.Cloud, $"~{totalTokens} tokens exceed local context window ({_opt.Ollama.ContextWindow})"),
             _ when totalTokens > r.MaxLocalTokens =>

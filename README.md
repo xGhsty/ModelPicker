@@ -9,8 +9,9 @@ The gateway exposes an OpenAI-compatible API (`/v1/chat/completions`), so you ca
 ## How the decision is made
 
 1. A small classifier model (`qwen3:1.7b`, running on the CPU) rates the task's difficulty (1 to 5) and the expected length of the answer.
-2. The gateway estimates how long the answer would take locally. It uses the speed measured on this computer at startup and the answer lengths it keeps learning as it runs.
+2. The gateway estimates how long the answer would take locally. It uses the speed measured on this computer at startup and the answer lengths it keeps learning as it runs (the first real answer of each length already replaces the default guess).
 3. The task goes to the cloud when:
+   - the task is about files or a project on your computer ("describe this project", "what does Program.cs do"): the local model cannot read them, the cloud CLI can,
    - the difficulty is at or above the threshold (4 by default),
    - the estimated local time exceeds the limit (30 s by default),
    - the task does not fit in the local model's context.
@@ -56,25 +57,31 @@ After installation, open a new PowerShell window.
 |---|---|
 | `modelpicker` | Starts the gateway in the background (no extra window) and a console chat. |
 | `modelpicker logs` | Follows the gateway's log (`%TEMP%\modelpicker-gateway.log`); run it in a second window. |
+| `modelpicker help` (or `-h`) | Lists all commands, the chat shortcuts and the main settings with their current defaults. |
 | `modelpicker -Key dev-key-intern` | Chat as a user with no cloud budget. |
 | `modelpicker -Restart` | Restarts the gateway, e.g. after code changes. |
 | `modelpicker -KeepRunning` | Leaves the gateway and models in memory after you exit the chat. |
 | `modelpicker-stop` | Stops the gateway and unloads the models from RAM and VRAM. |
-| `modelpicker setup` | Rescans the hardware and lets you choose the local model again. |
+| `modelpicker setup` | Rescans the hardware and lets you choose the local model again (arrow keys and Enter, Esc cancels). A running gateway keeps working; it is stopped only when you actually switch to another model. |
 | `modelpicker setup -List` | Shows which models fit the hardware, without changing the configuration. |
 
 Every command also has a short form: `mp` instead of `modelpicker` (e.g. `mp setup`, `mp -KeepRunning`) and `mp-stop` instead of `modelpicker-stop`. In PowerShell, `mp` is normally a built-in alias for `Move-ItemProperty`; the launcher replaces it in your sessions (the `Move-ItemProperty` command itself still works).
 
 On first launch, `modelpicker` runs the setup by itself if it has not been done yet.
 
-Chat commands:
+Chat commands. Type `/` to get the list under the input line: typing filters it, the arrow keys choose, Enter runs, Tab completes, Esc closes.
 
 | Command | Description |
 |---|---|
 | `/local`, `/cloud`, `/auto` | Forces the local model or the cloud, or restores automatic selection. |
 | `/reset` | Starts a new conversation. |
-| `/stats` | Measured hardware speed and token usage. |
+| `/stats` | The local model, its measured speed, your usage this month and the remaining cloud budget. |
+| `/help` | Commands and keyboard shortcuts. |
 | `/exit` | Exits. The gateway is stopped and the models are unloaded from memory. |
+
+Type `!` at the start of the line to switch to terminal mode, as in Claude Code: `!git status` or `!dotnet test` runs in the project folder, the output is shown and added to the conversation, so the next question can refer to it. Backspace on an empty line goes back to the chat. The up and down arrows recall earlier entries.
+
+The chat runs in the folder where you typed `mp`. The cloud CLI starts there too, so it knows that project (its `CLAUDE.md`, memory and files) and can read the files, without changing anything (Claude Code gets only the `Read`, `Grep` and `Glob` tools, Codex runs in a read-only sandbox).
 
 When a task is priced as cloud work, the chat shows the reason and a choice:
 

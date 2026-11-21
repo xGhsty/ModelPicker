@@ -1,4 +1,5 @@
 ﻿using System.Text.Json;
+using Microsoft.Extensions.Caching.Memory;
 using Microsoft.Extensions.Options;
 using ModelPicker;
 using ModelPicker.Models;
@@ -31,6 +32,7 @@ builder.Services.Configure<GatewayOptions>(builder.Configuration.GetSection("Gat
 builder.Services.AddSingleton<HardwareProfile>();
 builder.Services.AddSingleton<UsageTracker>();
 builder.Services.AddSingleton<OutputLengthProfile>();
+builder.Services.AddMemoryCache();
 builder.Services.AddHttpClient<OllamaClient>(c => c.Timeout = TimeSpan.FromMinutes(10));
 builder.Services.AddTransient<TaskAnalyzer>();
 builder.Services.AddTransient<Router>();
@@ -49,6 +51,7 @@ app.MapPost("/v1/chat/completions", async (
     OllamaClient ollama,
     UsageTracker usage,
     OutputLengthProfile lengths,
+    IMemoryCache handoffs,
     ILogger<Program> log,
     CancellationToken ct) =>
 {
@@ -58,7 +61,10 @@ app.MapPost("/v1/chat/completions", async (
     if (request.Messages.Count == 0)
         return Results.BadRequest(new { error = "messages must not be empty" });
 
-    var analysis = await analyzer.AnalyzeAsync(request, ct);
+    // Keyed by user too, so nobody can reuse another user's handoff.
+    var analysis = request.HandoffId is { } handoffId && handoffs.TryGetValue((employee.User, handoffId), out TaskAnalysis? earlier) && earlier is not null
+        ? earlier
+        : await analyzer.AnalyzeAsync(request, ct);
     var decision = router.Decide(request.Model, analysis, employee);
     log.LogInformation("{User}: {Target} ({Reason})", employee.User, decision.Target, decision.Reason);
 
@@ -155,6 +161,7 @@ app.MapPost("/v1/chat/completions", async (
             messages = compressed.Messages;
             log.LogInformation("Compression: {Note} (saved ~{Saved} tokens)", compression.Note, compression.SavedTokens);
         }
+        handoffs.Set((employee.User, id), analysis, TimeSpan.FromMinutes(30));
         var handoff = new CloudHandoff(id, "modelpicker.cloud_handoff", created, options.Value.Cloud.Providers, messages,
             new RoutingInfo("cloud", reason, analysis, compression, fallbackUsed));
 

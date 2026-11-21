@@ -50,17 +50,23 @@ public class OutputLengthProfile
         _data = Load(model) ?? new Data { Model = model };
     }
 
-    /// <summary>Expected answer length in tokens; Learned is false while there are too few samples.</summary>
+    /// <summary>Expected answer length in tokens; Learned is false while there is no sample yet.</summary>
     public (int Tokens, bool Learned) Estimate(string category, string expectedLength)
     {
         int fallback = Defaults.GetValueOrDefault(expectedLength, 600);
+        int floor = Floors.GetValueOrDefault(expectedLength, 40);
         lock (_lock)
         {
-            if (!_data.Samples.TryGetValue(Key(category, expectedLength), out var samples) || samples.Count < MinSamples)
+            if (!_data.Samples.TryGetValue(Key(category, expectedLength), out var samples) || samples.Count == 0)
                 return (fallback, false);
+            // A single real answer says more about this model than the fixed default. Tasks priced above the local
+            // time limit go to the cloud and teach nothing, so waiting for several samples could take very long.
+            // With few samples the longest one is used, the cautious choice.
+            if (samples.Count < MinSamples)
+                return (Math.Max(floor, samples.Max()), true);
             var sorted = samples.Order().ToList();
             int p80 = sorted[(int)Math.Ceiling(Percentile * sorted.Count) - 1];
-            return (Math.Max(Floors.GetValueOrDefault(expectedLength, 40), p80), true);
+            return (Math.Max(floor, p80), true);
         }
     }
 
