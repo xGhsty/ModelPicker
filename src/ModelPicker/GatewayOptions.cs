@@ -34,15 +34,24 @@ public class OllamaOptions
 }
 
 /// <summary>
-/// The gateway does not call any cloud API itself. When a task needs the cloud, it hands the (compressed)
+/// The gateway holds no cloud API key. For the chat, when a task needs the cloud, it hands the (compressed)
 /// conversation back to the client, which lets the user pick one of these providers and runs its CLI
 /// with the user's own login (e.g. "claude" for Claude Code, "codex" for Codex).
+/// Claude Code itself can also use the gateway as its API server (mp claude): its requests carry the user's
+/// own login, which the gateway forwards to AnthropicBaseUrl unchanged and never stores.
 /// </summary>
 public class CloudOptions
 {
     /// <summary>Provider ids the client may offer; empty = no cloud, every task stays local.</summary>
     // Empty by default: the configuration binder appends to a pre-filled list instead of replacing it.
     public List<string> Providers { get; set; } = [];
+    /// <summary>Where Claude Code's requests are forwarded when they go to the cloud.</summary>
+    public string AnthropicBaseUrl { get; set; } = "https://api.anthropic.com";
+    /// <summary>
+    /// Share of cache-read input tokens counted against the monthly budget. Claude Code re-reads its ~20-30k token
+    /// prompt from the cache on every step; the cloud bills those reads at about a tenth of normal input.
+    /// </summary>
+    public double CacheReadWeight { get; set; } = 0.1;
 }
 
 /// <summary>

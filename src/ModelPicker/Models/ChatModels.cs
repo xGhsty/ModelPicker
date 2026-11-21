@@ -73,5 +73,7 @@ public record UsageReport
     [JsonPropertyName("provider")] public string Provider { get; init; } = "";
     [JsonPropertyName("model")] public string? Model { get; init; }
     [JsonPropertyName("input_tokens")] public int InputTokens { get; init; }
+    /// <summary>Input read from the prompt cache; counted against the budget only partly (Cloud:CacheReadWeight).</summary>
+    [JsonPropertyName("cache_read_input_tokens")] public int CacheReadInputTokens { get; init; }
     [JsonPropertyName("output_tokens")] public int OutputTokens { get; init; }
 }

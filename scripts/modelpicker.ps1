@@ -9,6 +9,8 @@
 #   modelpicker logs             follow the gateway's log (it runs in the background, without a window)
 #   modelpicker setup            scan the hardware and choose the local model (runs automatically on first start)
 #   modelpicker setup -List      only show which models fit this hardware
+#   modelpicker claude           Claude Code with the gateway as its API server (your own login; budget counted)
+#   modelpicker-claude <args>    the same, passing arguments to claude (e.g. -c to continue)
 #   modelpicker help (-h)        list all commands and the main settings
 #   mp, mp-stop                  short forms of modelpicker and modelpicker-stop (same parameters)
 #
@@ -121,6 +123,8 @@ function Show-ModelPickerHelp {
         @("mp -Restart", "restart gatewaya, np. po zmianie kodu albo ustawień"),
         @("mp -KeepRunning", "po wyjściu z czatu modele zostają w pamięci (szybszy następny start)"),
         @("mp -Key <klucz>", "czat jako inny użytkownik (klucze w appsettings.json)"),
+        @("mp claude", "Claude Code przez gateway (Twoje logowanie, budżet liczony w gatewayu)"),
+        @("mp-claude <arg>", "to samo z argumentami dla claude, np. mp-claude -c (wznów rozmowę)"),
         @("mp setup", "skan sprzętu i wybór modelu lokalnego"),
         @("mp setup -List", "tylko pokaż, które modele pasują do tego sprzętu"),
         @("mp logs", "podgląd logu gatewaya na żywo"),
@@ -184,6 +188,7 @@ function Invoke-ModelPickerSetup([switch]$List) {
     # -tl:off: the MSBuild terminal logger draws live progress straight to the console, bypassing the redirect.
     $proc = Start-Process dotnet -ArgumentList "build", "-nologo", "-v", "q", "-tl:off" -WorkingDirectory $script:ModelPickerProject `
         -NoNewWindow -PassThru -RedirectStandardOutput $log -RedirectStandardError "$log.err"
+    if (-not $proc) { Write-Host "Nie udało się uruchomić kompilacji w $script:ModelPickerProject." -ForegroundColor Red; return }
     $null = $proc.Handle  # keeps ExitCode available after the process ends
     $sw = [Diagnostics.Stopwatch]::StartNew()
     $tick = 0
@@ -219,31 +224,19 @@ function Invoke-ModelPickerSetup([switch]$List) {
     }
 }
 
-function modelpicker {
-    param(
-        [string]$Command = "",
-        [switch]$List,
-        [string]$Key = "dev-key-jan",
-        [switch]$Restart,
-        [switch]$KeepRunning,
-        [Alias("h")][switch]$Help
-    )
-
-    if ($Help -or $Command -in "help", "/?", "?", "--help") { Show-ModelPickerHelp; return }
-    if ($Command -eq "setup") { Invoke-ModelPickerSetup -List:$List; return }
-    if ($Command -eq "logs") { Show-ModelPickerLog; return }
-    if ($Command) { Write-Host "Nieznana komenda: $Command. Wszystkie komendy: mp help" -ForegroundColor Red; return }
-
+# Ollama, setup check, gateway and warm-up. Returns @{ Ok; Started } - Started: this call launched the gateway.
+function Start-ModelPicker([switch]$Restart) {
+    $started = $false
     # 0. Prerequisites
     if (-not (Get-Command dotnet -ErrorAction SilentlyContinue)) {
         Write-Host "Brak .NET SDK - ModelPicker go potrzebuje. Zainstaluj: winget install Microsoft.DotNet.SDK.10" -ForegroundColor Red
         Write-Host "(albo https://dotnet.microsoft.com/download), potem otwórz nowe okno." -ForegroundColor DarkGray
-        return
+        return @{ Ok = $false; Started = $started }
     }
     if (-not (Get-Command ollama -ErrorAction SilentlyContinue)) {
         Write-Host "Brak Ollamy - ModelPicker uruchamia przez nią modele lokalne. Zainstaluj: winget install Ollama.Ollama" -ForegroundColor Red
         Write-Host "(albo https://ollama.com/download), potem otwórz nowe okno." -ForegroundColor DarkGray
-        return
+        return @{ Ok = $false; Started = $started }
     }
 
     # 1. Ollama
@@ -252,7 +245,7 @@ function modelpicker {
         $sw = [Diagnostics.Stopwatch]::StartNew()
         $tick = 0
         while (-not (Test-OllamaUp)) {
-            if ($sw.Elapsed.TotalSeconds -gt 30) { Write-Host ""; Write-Host "Ollama nie wystartowała w 30 s." -ForegroundColor Red; return }
+            if ($sw.Elapsed.TotalSeconds -gt 30) { Write-Host ""; Write-Host "Ollama nie wystartowała w 30 s." -ForegroundColor Red; return @{ Ok = $false; Started = $started } }
             Write-Progress-Dots "Uruchamiam Ollamę" ($tick++) $sw
             Start-Sleep -Milliseconds 500
         }
@@ -264,11 +257,11 @@ function modelpicker {
     if ($problem) {
         Write-Host "$problem - uruchamiam przygotowanie ModelPickera." -ForegroundColor Cyan
         Write-Host "(Możesz je powtórzyć w każdej chwili komendą: modelpicker setup)" -ForegroundColor DarkGray
-        Invoke-ModelPickerSetup
+        Invoke-ModelPickerSetup | Out-Host  # to the screen, not into this function's result
         $problem = Get-ModelPickerSetupProblem
         if ($problem) {
             Write-Host "$problem - ModelPicker nie może wystartować. Uruchom ponownie: modelpicker setup" -ForegroundColor Red
-            return
+            return @{ Ok = $false; Started = $started }
         }
     }
 
@@ -276,6 +269,7 @@ function modelpicker {
     if ($Restart) { if (Stop-ModelPickerGateway) { Start-Sleep -Seconds 1 } }
 
     if (-not (Test-ModelPickerUp)) {
+        $started = $true
         # In the background, without a window; the log is in a file (modelpicker logs).
         $gateway = Start-Process dotnet -ArgumentList "run", "--no-launch-profile" -WorkingDirectory $script:ModelPickerProject `
             -WindowStyle Hidden -PassThru -RedirectStandardOutput $script:GatewayLog -RedirectStandardError "$script:GatewayLog.err"
@@ -287,8 +281,8 @@ function modelpicker {
                 Write-Host ""
                 $why = if ($gateway.HasExited) { "zakończył się przy starcie" } else { "nie wystartował w 2 min" }
                 Write-Host "Gateway $why. Ostatnie linie logu ($script:GatewayLog):" -ForegroundColor Red
-                Get-Content $script:GatewayLog, "$script:GatewayLog.err" -Encoding UTF8 -ErrorAction SilentlyContinue | Select-Object -Last 20
-                return
+                Get-Content $script:GatewayLog, "$script:GatewayLog.err" -Encoding UTF8 -ErrorAction SilentlyContinue | Select-Object -Last 20 | Out-Host
+                return @{ Ok = $false; Started = $started }
             }
             Write-Progress-Dots "Czekam na start gatewaya" ($tick++) $sw
             Start-Sleep -Seconds 1
@@ -313,6 +307,82 @@ function modelpicker {
             Write-Host "Rozgrzewka trwa ponad 5 min - otwieram czat, pierwsze pytanie może być wolne." -ForegroundColor Yellow
         }
     }
+
+    @{ Ok = $true; Started = $started }
+}
+
+# Claude Code with the gateway as its API server. Every argument is passed to claude (e.g. mp-claude -c).
+# Its login stays its own: the gateway forwards it to the cloud and never stores it.
+function modelpicker-claude {
+    $Key = "dev-key-jan"; $Restart = $false; $KeepRunning = $false
+    $claudeArgs = New-Object System.Collections.Generic.List[string]
+    for ($i = 0; $i -lt $args.Count; $i++) {
+        switch -Exact ([string]$args[$i]) {
+            "-Key" { $Key = $args[++$i] }
+            "-Restart" { $Restart = $true }
+            "-KeepRunning" { $KeepRunning = $true }
+            default { $claudeArgs.Add([string]$args[$i]) }
+        }
+    }
+    $claude = Get-Command claude -All -ErrorAction SilentlyContinue | Where-Object { $_.Source -match '\.(exe|cmd|bat)$' } | Select-Object -First 1
+    if (-not $claude) {
+        Write-Host "Brak Claude Code. Zainstaluj: npm install -g @anthropic-ai/claude-code" -ForegroundColor Red
+        return
+    }
+
+    $start = Start-ModelPicker -Restart:$Restart
+    if (-not $start.Ok) { return }
+
+    Write-Host ""
+    Write-Host "Claude Code przez ModelPicker ($script:ModelPickerUrl). Logowanie zostaje Twoje, gateway liczy budżet." -ForegroundColor Yellow
+    Write-Host "  Na razie każde zadanie idzie do chmury; wybór modelu lokalnego będzie w następnym etapie." -ForegroundColor DarkGray
+    Write-Host ""
+
+    $saved = @{ ANTHROPIC_BASE_URL = $env:ANTHROPIC_BASE_URL; ANTHROPIC_CUSTOM_HEADERS = $env:ANTHROPIC_CUSTOM_HEADERS }
+    try {
+        # 127.0.0.1: Claude Code (Bun) would try IPv6 first for "localhost".
+        $env:ANTHROPIC_BASE_URL = $script:ModelPickerUrl -replace "localhost", "127.0.0.1"
+        # The gateway's own key, in a header of its own: Authorization carries Claude Code's login.
+        $env:ANTHROPIC_CUSTOM_HEADERS = "x-modelpicker-key: $Key"
+        & $claude.Source @claudeArgs
+    }
+    finally {
+        $env:ANTHROPIC_BASE_URL = $saved.ANTHROPIC_BASE_URL
+        $env:ANTHROPIC_CUSTOM_HEADERS = $saved.ANTHROPIC_CUSTOM_HEADERS
+        # Only a gateway this command started is stopped: a chat in another window may be using it.
+        if ($start.Started -and -not $KeepRunning) {
+            Write-Host "`nSprzątam..." -ForegroundColor Cyan
+            modelpicker-stop
+        } elseif ($start.Started) {
+            Write-Host "Gateway i modele zostają w pamięci (-KeepRunning). Zwolnisz je: modelpicker-stop" -ForegroundColor DarkGray
+        }
+    }
+}
+
+function modelpicker {
+    param(
+        [string]$Command = "",
+        [switch]$List,
+        [string]$Key = "dev-key-jan",
+        [switch]$Restart,
+        [switch]$KeepRunning,
+        [Alias("h")][switch]$Help
+    )
+
+    if ($Help -or $Command -in "help", "/?", "?", "--help") { Show-ModelPickerHelp; return }
+    if ($Command -eq "setup") { Invoke-ModelPickerSetup -List:$List; return }
+    if ($Command -eq "logs") { Show-ModelPickerLog; return }
+    if ($Command -eq "claude") {
+        $a = @("-Key", $Key)
+        if ($Restart) { $a += "-Restart" }
+        if ($KeepRunning) { $a += "-KeepRunning" }
+        modelpicker-claude @a
+        return
+    }
+    if ($Command) { Write-Host "Nieznana komenda: $Command. Wszystkie komendy: mp help" -ForegroundColor Red; return }
+
+    $start = Start-ModelPicker -Restart:$Restart
+    if (-not $start.Ok) { return }
 
     Write-Host ""
     Write-Host "Zadania wycenione na chmurę zapytają o providera: Claude Code (claude) albo Codex (codex)." -ForegroundColor Yellow
@@ -342,3 +412,4 @@ function modelpicker {
 if (Test-Path Alias:mp) { Remove-Item Alias:mp -Force }
 Set-Alias -Name mp -Value modelpicker -Scope Global
 Set-Alias -Name mp-stop -Value modelpicker-stop -Scope Global
+Set-Alias -Name mp-claude -Value modelpicker-claude -Scope Global

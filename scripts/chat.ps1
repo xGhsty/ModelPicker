@@ -173,7 +173,7 @@ function Invoke-CloudProvider([string]$Id, [string]$Exe, [string]$Prompt, [Diagn
         Clear-Waiting
     }
 
-    $r = @{ Content = $null; Model = $cloudProviders[$Id].Name; InputTokens = 0; OutputTokens = 0 }
+    $r = @{ Content = $null; Model = $cloudProviders[$Id].Name; InputTokens = 0; CacheReadTokens = 0; OutputTokens = 0 }
     switch ($Id) {
         "claude" {
             try { $j = $text | ConvertFrom-Json } catch { throw "Claude Code nie zwrócił odpowiedzi: $(if ($errText) { $errText } else { $text })" }
@@ -182,7 +182,8 @@ function Invoke-CloudProvider([string]$Id, [string]$Exe, [string]$Prompt, [Diagn
             $model = @($j.modelUsage.PSObject.Properties.Name) | Select-Object -First 1
             if ($model) { $r.Model = "Claude Code ($model)" }
             $u = $j.usage
-            $r.InputTokens = [int]$u.input_tokens + [int]$u.cache_creation_input_tokens + [int]$u.cache_read_input_tokens
+            $r.InputTokens = [int]$u.input_tokens + [int]$u.cache_creation_input_tokens
+            $r.CacheReadTokens = [int]$u.cache_read_input_tokens  # the gateway counts these only partly (they cost ~10%)
             $r.OutputTokens = [int]$u.output_tokens
         }
         "codex" {
@@ -292,7 +293,7 @@ function Resolve-CloudProvider([string]$Id) {
 
 function Send-CloudUsage([string]$Id, $Result) {
     try {
-        $body = @{ provider = $Id; model = $Result.Model; input_tokens = $Result.InputTokens; output_tokens = $Result.OutputTokens } | ConvertTo-Json
+        $body = @{ provider = $Id; model = $Result.Model; input_tokens = $Result.InputTokens; cache_read_input_tokens = $Result.CacheReadTokens; output_tokens = $Result.OutputTokens } | ConvertTo-Json
         $r = Invoke-RestMethod -Method Post "$Url/v1/usage" -Headers @{ Authorization = "Bearer $Key" } `
             -ContentType "application/json; charset=utf-8" -Body $utf8.GetBytes($body) -TimeoutSec 10
         $r.remaining_cloud_tokens
@@ -710,7 +711,7 @@ while ($true) {
             }
             $answer = $cloud.Content
             $remaining = Send-CloudUsage $choice $cloud
-            $footer = "{0} · {1:F1} s · {2:N0} wej. / {3:N0} wyj. tokenów" -f $cloud.Model, $sw.Elapsed.TotalSeconds, $cloud.InputTokens, $cloud.OutputTokens
+            $footer = "{0} · {1:F1} s · {2:N0} wej. / {3:N0} wyj. tokenów" -f $cloud.Model, $sw.Elapsed.TotalSeconds, ($cloud.InputTokens + $cloud.CacheReadTokens), $cloud.OutputTokens
             if ($null -ne $remaining) { $footer += " · budżet chmury: zostało {0:N0}" -f $remaining }
             $footerColor = "Magenta"
             $res = $null

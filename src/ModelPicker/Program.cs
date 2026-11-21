@@ -34,6 +34,8 @@ builder.Services.AddSingleton<UsageTracker>();
 builder.Services.AddSingleton<OutputLengthProfile>();
 builder.Services.AddMemoryCache();
 builder.Services.AddHttpClient<OllamaClient>(c => c.Timeout = TimeSpan.FromMinutes(10));
+// No timeout: a Claude Code answer streams for as long as it needs; a closed connection cancels it.
+builder.Services.AddHttpClient<AnthropicProxy>(c => c.Timeout = Timeout.InfiniteTimeSpan);
 builder.Services.AddTransient<TaskAnalyzer>();
 builder.Services.AddTransient<Router>();
 builder.Services.AddTransient<ContextCompressor>();
@@ -191,15 +193,49 @@ app.MapPost("/v1/usage", (HttpContext http, UsageReport report, IOptions<Gateway
     var employee = Authenticate(http, options.Value);
     if (employee is null)
         return Results.Json(new { error = "Invalid or missing API key" }, statusCode: 401);
-    if (report.InputTokens < 0 || report.OutputTokens < 0)
+    if (report.InputTokens < 0 || report.OutputTokens < 0 || report.CacheReadInputTokens < 0)
         return Results.BadRequest(new { error = "token counts must not be negative" });
 
-    usage.Record(employee, Target.Cloud, report.InputTokens + report.OutputTokens);
-    log.LogInformation("{User}: cloud via {Provider} ({Model}), {Tokens} tokens", employee.User, report.Provider, report.Model, report.InputTokens + report.OutputTokens);
+    int tokens = new CloudUsage(report.Model ?? "", report.InputTokens, 0, report.CacheReadInputTokens, report.OutputTokens)
+        .BudgetTokens(options.Value.Cloud.CacheReadWeight);
+    usage.Record(employee, Target.Cloud, tokens);
+    log.LogInformation("{User}: cloud via {Provider} ({Model}), {Tokens} budget tokens", employee.User, report.Provider, report.Model, tokens);
     return Results.Ok(new { remaining_cloud_tokens = usage.RemainingCloudTokens(employee) });
 });
 
-app.MapGet("/stats", (HttpContext http, IOptions<GatewayOptions> options, HardwareProfile hardware, UsageTracker usage) =>
+// ---- Claude Code with the gateway as its API server (ANTHROPIC_BASE_URL, set by "mp claude") ----
+
+// Claude Code checks that the server is reachable before its first request.
+app.MapMethods("/api/hello", ["GET", "HEAD"], () => Results.Ok());
+
+// Everything else under /v1 that is not the gateway's own endpoint (/v1/messages, /v1/messages/count_tokens, ...)
+// is Anthropic's API. For now every request goes to the cloud; routing to local models comes next.
+app.Map("/v1/{**path}", async (HttpContext http, IOptions<GatewayOptions> options, AnthropicProxy proxy, UsageTracker usage, CancellationToken ct) =>
+{
+    // Claude Code's own Authorization header carries the user's Anthropic login, so the gateway key
+    // travels in a header of its own (ANTHROPIC_CUSTOM_HEADERS).
+    var key = http.Request.Headers[AnthropicProxy.KeyHeader].ToString();
+    var employee = options.Value.ApiKeys.FirstOrDefault(k => k.Key == key && key.Length > 0);
+    if (employee is null)
+    {
+        await AnthropicProxy.WriteErrorAsync(http, 401, "authentication_error",
+            $"ModelPicker: brak lub nieznany klucz gatewaya (nagłówek {AnthropicProxy.KeyHeader}). Uruchom przez: mp claude");
+        return;
+    }
+
+    using var buffer = new MemoryStream();
+    await http.Request.Body.CopyToAsync(buffer, ct);
+    bool isCompletion = http.Request.Path.Equals("/v1/messages", StringComparison.OrdinalIgnoreCase) && HttpMethods.IsPost(http.Request.Method);
+    if (isCompletion && usage.RemainingCloudTokens(employee) <= 0)
+    {
+        await AnthropicProxy.WriteErrorAsync(http, 403, "permission_error",
+            $"ModelPicker: miesięczny budżet chmury użytkownika {employee.User} jest wyczerpany ({employee.MonthlyCloudTokenBudget:N0} tokenów).");
+        return;
+    }
+    await proxy.ForwardAsync(http, employee, buffer.ToArray(), ct);
+});
+
+app.MapGet("/stats",(HttpContext http, IOptions<GatewayOptions> options, HardwareProfile hardware, UsageTracker usage) =>
 {
     // Without a key: readiness and hardware only (the launcher polls this). With one: also who you are and your budget.
     var employee = Authenticate(http, options.Value);

@@ -56,6 +56,8 @@ After installation, open a new PowerShell window.
 | Command | Description |
 |---|---|
 | `modelpicker` | Starts the gateway in the background (no extra window) and a console chat. |
+| `modelpicker claude` | Starts Claude Code with the gateway as its API server (see [Claude Code through the gateway](#claude-code-through-the-gateway)). |
+| `modelpicker-claude <args>` | The same, passing the arguments to `claude`, e.g. `mp-claude -c` to continue the last conversation. |
 | `modelpicker logs` | Follows the gateway's log (`%TEMP%\modelpicker-gateway.log`); run it in a second window. |
 | `modelpicker help` (or `-h`) | Lists all commands, the chat shortcuts and the main settings with their current defaults. |
 | `modelpicker -Key dev-key-intern` | Chat as a user with no cloud budget. |
@@ -65,7 +67,7 @@ After installation, open a new PowerShell window.
 | `modelpicker setup` | Rescans the hardware and lets you choose the local model again (arrow keys and Enter, Esc cancels). A running gateway keeps working; it is stopped only when you actually switch to another model. |
 | `modelpicker setup -List` | Shows which models fit the hardware, without changing the configuration. |
 
-Every command also has a short form: `mp` instead of `modelpicker` (e.g. `mp setup`, `mp -KeepRunning`) and `mp-stop` instead of `modelpicker-stop`. In PowerShell, `mp` is normally a built-in alias for `Move-ItemProperty`; the launcher replaces it in your sessions (the `Move-ItemProperty` command itself still works).
+Every command also has a short form: `mp` instead of `modelpicker` (e.g. `mp setup`, `mp -KeepRunning`) `mp-stop` instead of `modelpicker-stop` and `mp-claude` instead of `modelpicker-claude`. In PowerShell, `mp` is normally a built-in alias for `Move-ItemProperty`; the launcher replaces it in your sessions (the `Move-ItemProperty` command itself still works).
 
 On first launch, `modelpicker` runs the setup by itself if it has not been done yet.
 
@@ -97,6 +99,16 @@ When a task is priced as cloud work, the chat shows the reason and a choice:
 
 Move with the arrow keys and confirm with Enter; the cursor starts on the provider chosen last time. The chat checks that the CLI is installed and logged in (`claude auth status`, `codex login status`); if not, it opens the CLI's own login (`claude auth login`, `codex login`) in the same window. The CLI then answers non-interactively with its tools turned off (Claude Code) or in a read-only sandbox (Codex), so nothing on the computer is changed. The tokens it reports are counted against the monthly cloud budget.
 
+## Claude Code through the gateway
+
+`mp claude` starts Claude Code as usual, in the current folder, but sets `ANTHROPIC_BASE_URL` to the gateway, so every request Claude Code makes goes through it. The gateway key travels in its own header (`x-modelpicker-key`, via `ANTHROPIC_CUSTOM_HEADERS`), because Claude Code's `Authorization` header carries your own Anthropic login (subscription or API key). The gateway forwards that login to `Cloud.AnthropicBaseUrl` unchanged and never stores or logs it, so no cloud API key is configured anywhere.
+
+On the way back the gateway reads the token usage of each answer and counts it against your monthly budget; once it is used up, requests are refused with a message Claude Code shows as an API error. Cache reads count at `Cloud.CacheReadWeight` (10% by default): Claude Code re-reads its ~20-30k token prompt from the cache on every step, and the cloud bills those reads at about a tenth of normal input. The chat's cloud answers are counted the same way.
+
+For now every Claude Code request goes to the cloud. Next steps: routing per task to local models (several local models chosen by task difficulty), with the cloud kept for what they cannot do.
+
+When `mp claude` started the gateway itself, it stops it on exit (unless `-KeepRunning`); a gateway that was already running, e.g. for a chat in another window, keeps running.
+
 ## API
 
 The gateway listens on `http://localhost:5080`.
@@ -119,7 +131,7 @@ When the task needs the cloud, the gateway does not answer it. It returns a hand
 ```powershell
 Invoke-RestMethod -Method Post http://localhost:5080/v1/usage `
     -Headers @{ Authorization = "Bearer dev-key-jan" } -ContentType "application/json" `
-    -Body '{ "provider": "claude", "model": "claude-opus-5-5", "input_tokens": 3600, "output_tokens": 120 }'
+    -Body '{ "provider": "claude", "model": "claude-opus-5-5", "input_tokens": 3600, "cache_read_input_tokens": 0, "output_tokens": 120 }'
 ```
 
 With `"stream": true` the response arrives as server-sent events. The first event contains the routing decision and is sent immediately; a cloud task then ends with the handoff event.
@@ -135,6 +147,8 @@ The main settings are in `src/ModelPicker/appsettings.json`, in the `Gateway` se
 | `Ollama.Model` | The local model. Usually set by `modelpicker setup`. |
 | `Ollama.ClassifierModel` | The model that rates task difficulty. |
 | `Cloud.Providers` | Cloud providers the chat may offer (`claude`, `codex`). An empty list keeps every task local. |
+| `Cloud.AnthropicBaseUrl` | Where `mp claude` requests are forwarded (`https://api.anthropic.com`). |
+| `Cloud.CacheReadWeight` | Share of cache-read tokens counted against the budget (0.1). |
 | `Routing.CloudDifficultyThreshold` | The difficulty from which a task goes to the cloud. |
 | `Routing.MaxLocalLatencySeconds` | The maximum acceptable local response time. |
 | `Compression.*` | When and how to summarize the history before sending it to the cloud. |
