@@ -8,3 +8,5 @@ appsettings.Local.json
 # Per-machine learned answer lengths (numbers and prompt hashes only)
 modelpicker-stats.json
 modelpicker-stats.json.tmp
+modelpicker-speed.json
+modelpicker-speed.json.tmp

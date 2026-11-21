@@ -150,6 +150,7 @@ These files are created in `src/ModelPicker/` separately on each computer and ar
 |---|---|
 | `appsettings.Local.json` | The local model chosen by `modelpicker setup`. |
 | `modelpicker-stats.json` | Local model answer lengths that the gateway learns from to estimate response time. Contains only numbers and hashes of the questions, not their text. |
+| `modelpicker-speed.json` | The local model's speed measured on real answers, used at the next start instead of the short startup benchmark (which reads too high). |
 
 ## Repository structure
 

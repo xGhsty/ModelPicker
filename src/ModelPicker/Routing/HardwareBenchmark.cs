@@ -25,7 +25,14 @@ public class HardwareBenchmark(OllamaClient ollama, HardwareProfile hardware, IL
         var classifier = Load(classifier: true);
         await Task.WhenAll(main, classifier);
 
-        if (await main)
+        if (await main && hardware.Measured)
+        {
+            // Real answers from earlier runs are a better measure than a short benchmark (which reads too high).
+            log.LogInformation(
+                "Local hardware (saved from earlier answers): prompt {Prompt:F0} tok/s, generation {Gen:F1} tok/s",
+                hardware.PromptTokensPerSecond, hardware.GenerationTokensPerSecond);
+        }
+        else if (await main)
         {
             // A prompt of several hundred tokens: a tiny prompt makes prompt processing look much slower than it is.
             var context = string.Concat(Enumerable.Repeat(
@@ -39,7 +46,7 @@ public class HardwareBenchmark(OllamaClient ollama, HardwareProfile hardware, IL
             {
                 await ollama.CompleteAsync(request, ct);
                 log.LogInformation(
-                    "Local hardware: prompt {Prompt:F0} tok/s, generation {Gen:F1} tok/s",
+                    "Local hardware (first guess from a short benchmark, replaced by the first real answer): prompt {Prompt:F0} tok/s, generation {Gen:F1} tok/s",
                     hardware.PromptTokensPerSecond, hardware.GenerationTokensPerSecond);
             }
             catch (Exception ex) when (ex is not OperationCanceledException)

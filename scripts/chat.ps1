@@ -340,7 +340,8 @@ function Write-InlineParts([string]$Text, [ConsoleColor]$Color = "Gray") {
     foreach ($part in [regex]::Split($Text, $script:InlinePattern)) {
         if ($part -eq "") { continue }
         if ($part -match '^`(.+)`$') { Write-Host $Matches[1] -NoNewline -ForegroundColor Yellow }
-        elseif ($part -match '^(\*\*|__)(.+)\1$') { Write-Host $Matches[2] -NoNewline -ForegroundColor White }
+        # Rendered again inside, for code in bold text ("**Pominięcie `virtual`**").
+        elseif ($part -match '^(\*\*|__)(.+)\1$') { Write-InlineParts $Matches[2] White }
         elseif ($part -match '^\[(.+)\]\((.+)\)$') {
             Write-Host $Matches[1] -NoNewline -ForegroundColor $Color
             Write-Host " ($($Matches[2]))" -NoNewline -ForegroundColor DarkGray
@@ -359,7 +360,7 @@ function Write-Inline([string]$Text, [ConsoleColor]$Color = "Gray") {
 
 # Length as displayed, i.e. without the inline marks.
 function Get-PlainLength([string]$Text) {
-    ([regex]::Replace($Text, '`([^`]+)`|\*\*([^*]+)\*\*|__([^_]+)__', '$1$2$3')).Length
+    ([regex]::Replace($Text, '`|\*\*|__', '')).Length
 }
 
 function Write-MarkdownTable([string[]]$Rows) {
