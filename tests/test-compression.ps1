@@ -63,7 +63,8 @@ $c = $r.routing.compression
 "Difficulty:  $($r.routing.analysis.difficulty)"
 "Compression: applied=$($c.applied), $($c.note)"
 "Tokens:      $($c.original_tokens) -> $($c.compressed_tokens) (saved $($c.saved_tokens)), summary took $($c.seconds)s, total $([Math]::Round($sw.Elapsed.TotalSeconds,1))s"
-"Cloud reply: $($r.choices[0].message.content)"
+if ($r.object -eq "modelpicker.cloud_handoff") { "Handoff:     $($r.messages.Count) messages for the client to send to: $($r.providers -join ', ')" }
+else { "Local reply: $($r.choices[0].message.content)" }
 ""
 "--- SUMMARY ---"
 $c.summary

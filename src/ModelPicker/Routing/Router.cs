@@ -1,5 +1,4 @@
 using Microsoft.Extensions.Options;
-using ModelPicker.Providers;
 using ModelPicker.Usage;
 
 namespace ModelPicker.Routing;
@@ -9,7 +8,7 @@ public enum Target { Local, Cloud }
 public record RoutingDecision(Target Target, string Reason);
 
 /// <summary>Turns a task analysis into a local/cloud decision using the configured policy.</summary>
-public class Router(IOptions<GatewayOptions> options, UsageTracker usage, AnthropicClient cloud)
+public class Router(IOptions<GatewayOptions> options, UsageTracker usage)
 {
     private readonly GatewayOptions _opt = options.Value;
 
@@ -35,8 +34,8 @@ public class Router(IOptions<GatewayOptions> options, UsageTracker usage, Anthro
 
         if (wanted.Target == Target.Cloud)
         {
-            if (!cloud.IsConfigured)
-                return new(Target.Local, $"{wanted.Reason}, but cloud is not configured");
+            if (_opt.Cloud.Providers.Count == 0)
+                return new(Target.Local, $"{wanted.Reason}, but no cloud provider is configured");
             if (usage.RemainingCloudTokens(employee) < totalTokens)
                 return new(Target.Local, $"{wanted.Reason}, but monthly cloud budget is exhausted");
         }

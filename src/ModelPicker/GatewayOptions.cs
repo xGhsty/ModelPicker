@@ -33,15 +33,16 @@ public class OllamaOptions
     public double DefaultGenerationTokensPerSecond { get; set; } = 40;
 }
 
+/// <summary>
+/// The gateway does not call any cloud API itself. When a task needs the cloud, it hands the (compressed)
+/// conversation back to the client, which lets the user pick one of these providers and runs its CLI
+/// with the user's own login (e.g. "claude" for Claude Code, "codex" for Codex).
+/// </summary>
 public class CloudOptions
 {
-    public string BaseUrl { get; set; } = "https://api.anthropic.com";
-    public string Model { get; set; } = "claude-sonnet-5-5";
-    /// <summary>Read from the ANTHROPIC_API_KEY environment variable when empty.</summary>
-    public string ApiKey { get; set; } = "";
-    public int DefaultMaxTokens { get; set; } = 4096;
-    /// <summary>Do not call the cloud; return a placeholder answer (for testing routing without an API key).</summary>
-    public bool Simulate { get; set; }
+    /// <summary>Provider ids the client may offer; empty = no cloud, every task stays local.</summary>
+    // Empty by default: the configuration binder appends to a pre-filled list instead of replacing it.
+    public List<string> Providers { get; set; } = [];
 }
 
 /// <summary>

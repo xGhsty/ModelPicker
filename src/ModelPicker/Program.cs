@@ -1,4 +1,4 @@
-using System.Text.Json;
+﻿using System.Text.Json;
 using Microsoft.Extensions.Options;
 using ModelPicker;
 using ModelPicker.Models;
@@ -32,7 +32,6 @@ builder.Services.AddSingleton<HardwareProfile>();
 builder.Services.AddSingleton<UsageTracker>();
 builder.Services.AddSingleton<OutputLengthProfile>();
 builder.Services.AddHttpClient<OllamaClient>(c => c.Timeout = TimeSpan.FromMinutes(10));
-builder.Services.AddHttpClient<AnthropicClient>(c => c.Timeout = TimeSpan.FromMinutes(10));
 builder.Services.AddTransient<TaskAnalyzer>();
 builder.Services.AddTransient<Router>();
 builder.Services.AddTransient<ContextCompressor>();
@@ -48,7 +47,6 @@ app.MapPost("/v1/chat/completions", async (
     Router router,
     ContextCompressor compressor,
     OllamaClient ollama,
-    AnthropicClient cloud,
     UsageTracker usage,
     OutputLengthProfile lengths,
     ILogger<Program> log,
@@ -77,7 +75,7 @@ app.MapPost("/v1/chat/completions", async (
         await Sse(new
         {
             id, @object = "chat.completion.chunk", created,
-            model = decision.Target == Target.Local ? options.Value.Ollama.Model : options.Value.Cloud.Model,
+            model = decision.Target == Target.Local ? options.Value.Ollama.Model : "cloud",
             choices = new[] { new { index = 0, delta = new { role = "assistant" }, finish_reason = (string?)null } },
             routing = new { phase = "decided", target = decision.Target.ToString().ToLowerInvariant(), reason = decision.Reason, analysis },
         });
@@ -85,45 +83,35 @@ app.MapPost("/v1/chat/completions", async (
 
     try
     {
-        // Spend local time to save cloud tokens; a fallback to cloud skips this, since the local model just failed.
-        var cloudRequest = request;
-        CompressionInfo? compression = null;
         if (decision.Target == Target.Cloud)
-        {
-            (cloudRequest, compression) = await compressor.CompressAsync(request, ct);
-            log.LogInformation("Compression: {Note} (saved ~{Saved} tokens)", compression.Note, compression.SavedTokens);
-        }
+            return await HandOff(decision.Reason, fallbackUsed: false);
 
-        var target = decision.Target;
-        bool fallbackUsed = false;
         CompletionResult result;
         try
         {
-            result = await Run(target, cloudRequest);
+            result = await ollama.CompleteAsync(request, ct);
         }
-        catch (Exception ex) when (ex is not OperationCanceledException && options.Value.Routing.EnableFallback && CanFallBack(target))
+        catch (Exception ex) when (ex is not OperationCanceledException && options.Value.Routing.EnableFallback && CloudAllowed())
         {
-            log.LogWarning("{Target} failed ({Message}), falling back", target, ex.Message);
-            target = target == Target.Local ? Target.Cloud : Target.Local;
-            fallbackUsed = true;
-            result = await Run(target, cloudRequest);
+            log.LogWarning("Local model failed ({Message}), handing the task to the cloud", ex.Message);
+            return await HandOff($"local model failed ({ex.Message})", fallbackUsed: true);
         }
 
-        usage.Record(employee, target, result.InputTokens + result.OutputTokens);
+        usage.Record(employee, Target.Local, result.InputTokens + result.OutputTokens);
 
         // Learn how long the local model really answers. Answers cut off by max_tokens would understate it.
         bool truncated = request.MaxTokens is { } limit && result.OutputTokens >= limit;
-        if (target == Target.Local && !truncated)
+        if (!truncated)
         {
             var prompt = request.Messages.LastOrDefault(m => m.Role == "user")?.Content ?? "";
             lengths.Record(analysis.Category, analysis.ExpectedLength, prompt, result.OutputTokens);
         }
-        var routing = new RoutingInfo(target.ToString().ToLowerInvariant(), decision.Reason, analysis, compression, fallbackUsed);
+        var routing = new RoutingInfo("local", decision.Reason, analysis, null, false);
         var tokens = new ChatUsage(result.InputTokens, result.OutputTokens, result.InputTokens + result.OutputTokens);
 
         if (!stream)
         {
-            http.Response.Headers["X-ModelPicker-Route"] = target.ToString().ToLowerInvariant();
+            http.Response.Headers["X-ModelPicker-Route"] = "local";
             return Results.Ok(new ChatResponse(
                 id, "chat.completion", created, result.Model,
                 [new ChatChoice(0, new ChatMessage("assistant", result.Content), "stop")],
@@ -154,8 +142,31 @@ app.MapPost("/v1/chat/completions", async (
         return Results.Empty;
     }
 
-    Task<CompletionResult> Run(Target t, ChatRequest cloudRequest) =>
-        t == Target.Local ? ollama.CompleteAsync(request, ct) : cloud.CompleteAsync(cloudRequest, ct);
+    // The gateway does not talk to any cloud API: the client picks a provider and runs it with the user's login.
+    async Task<IResult> HandOff(string reason, bool fallbackUsed)
+    {
+        // Spend local time to save cloud tokens; after a local failure this is skipped, the local model just failed.
+        var messages = request.Messages;
+        CompressionInfo? compression = null;
+        if (!fallbackUsed)
+        {
+            ChatRequest compressed;
+            (compressed, compression) = await compressor.CompressAsync(request, ct);
+            messages = compressed.Messages;
+            log.LogInformation("Compression: {Note} (saved ~{Saved} tokens)", compression.Note, compression.SavedTokens);
+        }
+        var handoff = new CloudHandoff(id, "modelpicker.cloud_handoff", created, options.Value.Cloud.Providers, messages,
+            new RoutingInfo("cloud", reason, analysis, compression, fallbackUsed));
+
+        if (!stream)
+        {
+            http.Response.Headers["X-ModelPicker-Route"] = "cloud";
+            return Results.Ok(handoff);
+        }
+        await Sse(handoff);
+        await http.Response.WriteAsync("data: [DONE]\n\n", ct);
+        return Results.Empty;
+    }
 
     async Task Sse(object payload)
     {
@@ -163,22 +174,48 @@ app.MapPost("/v1/chat/completions", async (
         await http.Response.Body.FlushAsync(ct);
     }
 
-    // Falling back to cloud must still respect access and budget.
-    bool CanFallBack(Target failed) =>
-        failed == Target.Cloud || (cloud.IsConfigured && usage.RemainingCloudTokens(employee) > 0);
+    // Handing a failed local task to the cloud must still respect access and budget.
+    bool CloudAllowed() => options.Value.Cloud.Providers.Count > 0 && usage.RemainingCloudTokens(employee) > 0;
 });
 
-app.MapGet("/stats", (HardwareProfile hardware, UsageTracker usage) => Results.Ok(new
+// The client reports what a cloud provider it ran (after a handoff) spent, so monthly budgets keep working.
+app.MapPost("/v1/usage", (HttpContext http, UsageReport report, IOptions<GatewayOptions> options, UsageTracker usage, ILogger<Program> log) =>
 {
-    ready = hardware.WarmedUp,
-    hardware = new
+    var employee = Authenticate(http, options.Value);
+    if (employee is null)
+        return Results.Json(new { error = "Invalid or missing API key" }, statusCode: 401);
+    if (report.InputTokens < 0 || report.OutputTokens < 0)
+        return Results.BadRequest(new { error = "token counts must not be negative" });
+
+    usage.Record(employee, Target.Cloud, report.InputTokens + report.OutputTokens);
+    log.LogInformation("{User}: cloud via {Provider} ({Model}), {Tokens} tokens", employee.User, report.Provider, report.Model, report.InputTokens + report.OutputTokens);
+    return Results.Ok(new { remaining_cloud_tokens = usage.RemainingCloudTokens(employee) });
+});
+
+app.MapGet("/stats", (HttpContext http, IOptions<GatewayOptions> options, HardwareProfile hardware, UsageTracker usage) =>
+{
+    // Without a key: readiness and hardware only (the launcher polls this). With one: also who you are and your budget.
+    var employee = Authenticate(http, options.Value);
+    return Results.Ok(new
     {
-        prompt_tokens_per_second = Math.Round(hardware.PromptTokensPerSecond),
-        generation_tokens_per_second = Math.Round(hardware.GenerationTokensPerSecond, 1),
-        samples = hardware.Samples,
-    },
-    usage = usage.CurrentMonthUsage(),
-}));
+        ready = hardware.WarmedUp,
+        models = new { local = options.Value.Ollama.Model, classifier = options.Value.Ollama.ClassifierModel },
+        hardware = new
+        {
+            prompt_tokens_per_second = Math.Round(hardware.PromptTokensPerSecond),
+            generation_tokens_per_second = Math.Round(hardware.GenerationTokensPerSecond, 1),
+            samples = hardware.Samples,
+        },
+        me = employee is null ? null : new
+        {
+            user = employee.User,
+            monthly_cloud_token_budget = employee.MonthlyCloudTokenBudget,
+            remaining_cloud_tokens = usage.RemainingCloudTokens(employee),
+            usage = usage.CurrentMonthUsage().FirstOrDefault(u => u.User == employee.User),
+        },
+        usage = usage.CurrentMonthUsage(),
+    });
+});
 
 app.Run();
 return 0;

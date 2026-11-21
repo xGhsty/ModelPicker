@@ -1,6 +1,8 @@
 # ModelPicker
 
-A local gateway for language models. For every request it decides on its own whether to run it on a local model (through Ollama) or send it to the cloud (Claude). Simple tasks stay on your computer and cost nothing; hard ones, or ones that would be too slow locally, go to the cloud.
+A local gateway for language models. For every request it decides on its own whether to run it on a local model (through Ollama) or send it to the cloud. Simple tasks stay on your computer and cost nothing; hard ones, or ones that would be too slow locally, go to the cloud.
+
+The gateway is not tied to any one cloud API or API key. When a task needs the cloud, the chat tells you so and asks which provider to use: **Claude Code** (`claude`) or **Codex** (`codex`). The chosen CLI runs on your computer with your own login, just like typing `claude` in a terminal: if you are not logged in, its login screen appears first.
 
 The gateway exposes an OpenAI-compatible API (`/v1/chat/completions`), so you can connect any tool that supports OpenAI: IDE plugins, SDKs, your own scripts.
 
@@ -12,16 +14,17 @@ The gateway exposes an OpenAI-compatible API (`/v1/chat/completions`), so you ca
    - the difficulty is at or above the threshold (4 by default),
    - the estimated local time exceeds the limit (30 s by default),
    - the task does not fit in the local model's context.
-4. The task stays local when the user has no cloud budget or the cloud is not configured.
-5. If the chosen model fails, the other one answers (fallback).
+4. The task stays local when the user has no cloud budget or no cloud provider is configured.
+5. If the local model fails, the task is handed to the cloud (fallback). If a cloud provider fails, the chat lets you pick another one or run the task locally.
 
-Before a request is sent to the cloud, the older part of a long conversation is summarized locally to use fewer paid tokens.
+Before a task is handed to the cloud, the older part of a long conversation is summarized locally to use fewer cloud tokens.
 
 ## Requirements
 
 - Windows 10 or 11, PowerShell 5.1 or later
 - [.NET 10 SDK](https://dotnet.microsoft.com/download)
 - [Ollama](https://ollama.com/download)
+- For cloud tasks, at least one provider CLI: [Claude Code](https://docs.claude.com/en/docs/claude-code) (`npm install -g @anthropic-ai/claude-code`) or [Codex](https://github.com/openai/codex) (`npm install -g @openai/codex`)
 
 The install script can install a missing .NET SDK and Ollama through `winget`.
 
@@ -51,15 +54,16 @@ After installation, open a new PowerShell window.
 
 | Command | Description |
 |---|---|
-| `modelpicker` | Starts the gateway and a console chat. The cloud is simulated (no cost). |
-| `modelpicker -FakeCloud` | "Cloud" requests go through the real API client but are answered by a small model in Ollama. A free test of the whole path. |
-| `modelpicker -Real` | The real Claude answers. Requires the `ANTHROPIC_API_KEY` variable. |
+| `modelpicker` | Starts the gateway in the background (no extra window) and a console chat. |
+| `modelpicker logs` | Follows the gateway's log (`%TEMP%\modelpicker-gateway.log`); run it in a second window. |
 | `modelpicker -Key dev-key-intern` | Chat as a user with no cloud budget. |
 | `modelpicker -Restart` | Restarts the gateway, e.g. after code changes. |
 | `modelpicker -KeepRunning` | Leaves the gateway and models in memory after you exit the chat. |
 | `modelpicker-stop` | Stops the gateway and unloads the models from RAM and VRAM. |
 | `modelpicker setup` | Rescans the hardware and lets you choose the local model again. |
 | `modelpicker setup -List` | Shows which models fit the hardware, without changing the configuration. |
+
+Every command also has a short form: `mp` instead of `modelpicker` (e.g. `mp setup`, `mp -KeepRunning`) and `mp-stop` instead of `modelpicker-stop`. In PowerShell, `mp` is normally a built-in alias for `Move-ItemProperty`; the launcher replaces it in your sessions (the `Move-ItemProperty` command itself still works).
 
 On first launch, `modelpicker` runs the setup by itself if it has not been done yet.
 
@@ -72,11 +76,19 @@ Chat commands:
 | `/stats` | Measured hardware speed and token usage. |
 | `/exit` | Exits. The gateway is stopped and the models are unloaded from memory. |
 
-Set the Anthropic API key once for your account:
+When a task is priced as cloud work, the chat shows the reason and a choice:
 
-```powershell
-[Environment]::SetEnvironmentVariable('ANTHROPIC_API_KEY', 'sk-ant-...', 'User')
 ```
++-- Zadanie zostało wycenione na użycie chmury
+|   Powód: difficulty 4 >= threshold 4
+  (strzałki: wybór, Enter: zatwierdź)
+  > Claude Code
+    Codex
+    Lokalnie mimo to (wolniej, bez kosztów)
++--
+```
+
+Move with the arrow keys and confirm with Enter; the cursor starts on the provider chosen last time. The chat checks that the CLI is installed and logged in (`claude auth status`, `codex login status`); if not, it opens the CLI's own login (`claude auth login`, `codex login`) in the same window. The CLI then answers non-interactively with its tools turned off (Claude Code) or in a read-only sandbox (Codex), so nothing on the computer is changed. The tokens it reports are counted against the monthly cloud budget.
 
 ## API
 
@@ -93,9 +105,17 @@ Invoke-RestMethod -Method Post http://localhost:5080/v1/chat/completions `
     -ContentType "application/json" -Body $body
 ```
 
-The response uses the OpenAI format with an extra `routing` field: where the request went, why, the estimates, and compression details.
+When the task stays local, the response uses the OpenAI format with an extra `routing` field: where the request went, why, the estimates.
 
-With `"stream": true` the response arrives as server-sent events. The first event contains the routing decision and is sent immediately, before the answer is generated.
+When the task needs the cloud, the gateway does not answer it. It returns a handoff instead (`"object": "modelpicker.cloud_handoff"`), with the allowed `providers`, the conversation to send (`messages`, already compressed) and the `routing` details. The client runs the provider itself and reports what it spent:
+
+```powershell
+Invoke-RestMethod -Method Post http://localhost:5080/v1/usage `
+    -Headers @{ Authorization = "Bearer dev-key-jan" } -ContentType "application/json" `
+    -Body '{ "provider": "claude", "model": "claude-opus-5-5", "input_tokens": 3600, "output_tokens": 120 }'
+```
+
+With `"stream": true` the response arrives as server-sent events. The first event contains the routing decision and is sent immediately; a cloud task then ends with the handoff event.
 
 `GET /stats` returns the measured hardware speed, gateway readiness, and token usage.
 
@@ -107,13 +127,13 @@ The main settings are in `src/ModelPicker/appsettings.json`, in the `Gateway` se
 |---|---|
 | `Ollama.Model` | The local model. Usually set by `modelpicker setup`. |
 | `Ollama.ClassifierModel` | The model that rates task difficulty. |
-| `Cloud.Model` | The cloud model. |
+| `Cloud.Providers` | Cloud providers the chat may offer (`claude`, `codex`). An empty list keeps every task local. |
 | `Routing.CloudDifficultyThreshold` | The difficulty from which a task goes to the cloud. |
 | `Routing.MaxLocalLatencySeconds` | The maximum acceptable local response time. |
 | `Compression.*` | When and how to summarize the history before sending it to the cloud. |
 | `ApiKeys` | User keys and their monthly cloud token budgets (0 means no cloud access). |
 
-The `dev-key-jan` and `dev-key-intern` keys are for testing only. Do not put real keys in `appsettings.json`, because that file is in the repository. Put them in `appsettings.Local.json` (the `Gateway.ApiKeys` section), which overrides `appsettings.json` and is not committed. Keep the Anthropic API key in the `ANTHROPIC_API_KEY` environment variable, not in files.
+The `dev-key-jan` and `dev-key-intern` keys are for testing only. Do not put real keys in `appsettings.json`, because that file is in the repository. Put them in `appsettings.Local.json` (the `Gateway.ApiKeys` section), which overrides `appsettings.json` and is not committed. The gateway needs no cloud API key: each user logs in to their own provider CLI.
 
 ### Local files
 
@@ -138,4 +158,6 @@ These files are created in `src/ModelPicker/` separately on each computer and ar
 - The launcher and installer work only on Windows. The gateway itself is a .NET application and can also run on Linux and macOS (`dotnet run --project src/ModelPicker`).
 - GPU detection supports only NVIDIA cards. On other cards the wizard assumes there is no GPU and suggests a small model.
 - Token usage is kept in memory, so restarting the gateway resets the monthly budget counters.
+- Cloud usage is reported by the client, so the budget relies on the client being honest. Claude Code counts its own system prompt as input (about 3,600 tokens per answer).
+- Clients that only speak the OpenAI API (IDE plugins, SDKs) get local answers, but cannot follow a cloud handoff on their own.
 - The answer arrives in full once it is ready. For now, streaming only sends the routing decision ahead of time; it does not stream the answer word by word.

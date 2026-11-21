@@ -47,3 +47,25 @@ public record RoutingInfo(
 
 /// <summary>Provider-agnostic result of a completion.</summary>
 public record CompletionResult(string Model, string Content, int InputTokens, int OutputTokens);
+
+/// <summary>
+/// Returned instead of an answer when a task needs the cloud: the gateway does not call any cloud API itself.
+/// The client asks the user which provider to use (Claude Code, Codex...), runs that provider's CLI with the
+/// user's own login, and reports the tokens back to /v1/usage.
+/// </summary>
+public record CloudHandoff(
+    [property: JsonPropertyName("id")] string Id,
+    [property: JsonPropertyName("object")] string Object,
+    [property: JsonPropertyName("created")] long Created,
+    [property: JsonPropertyName("providers")] List<string> Providers,
+    [property: JsonPropertyName("messages")] List<ChatMessage> Messages,
+    [property: JsonPropertyName("routing")] RoutingInfo Routing);
+
+/// <summary>Tokens spent by a cloud provider the client ran on its own, counted against the monthly budget.</summary>
+public record UsageReport
+{
+    [JsonPropertyName("provider")] public string Provider { get; init; } = "";
+    [JsonPropertyName("model")] public string? Model { get; init; }
+    [JsonPropertyName("input_tokens")] public int InputTokens { get; init; }
+    [JsonPropertyName("output_tokens")] public int OutputTokens { get; init; }
+}

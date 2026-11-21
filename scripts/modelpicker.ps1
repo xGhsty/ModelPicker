@@ -1,15 +1,15 @@
 ﻿# Launcher for the ModelPicker test environment. Loaded from the PowerShell profile,
 # so in any new PowerShell window you can just type:
-#   modelpicker                  chat as jan.kowalski (cloud is simulated in Development)
-#   modelpicker -Real            real Claude answers (needs ANTHROPIC_API_KEY), restarts the gateway
-#   modelpicker -FakeCloud       free end-to-end test: the cloud path goes through the real Anthropic client,
-#                                but to Ollama's Anthropic-compatible API (small model qwen3:1.7b)
+#   modelpicker                  chat as jan.kowalski; tasks priced as cloud work ask which provider to use
+#                                (Claude Code or Codex CLI, with your own login - not logged in = login screen)
 #   modelpicker -Key dev-key-intern   user without cloud budget (always local)
 #   modelpicker -Restart         restart the gateway (e.g. after code changes)
 #   modelpicker -KeepRunning     on exit, leave the gateway and models loaded
 #   modelpicker-stop             stop the gateway and unload its models from RAM/VRAM
+#   modelpicker logs             follow the gateway's log (it runs in the background, without a window)
 #   modelpicker setup            scan the hardware and choose the local model (runs automatically on first start)
 #   modelpicker setup -List      only show which models fit this hardware
+#   mp, mp-stop                  short forms of modelpicker and modelpicker-stop (same parameters)
 #
 # Leaving the chat (/exit or Ctrl+C) runs modelpicker-stop automatically.
 # Closing the window with X cannot be intercepted - then run modelpicker-stop in a new window,
@@ -21,8 +21,8 @@ $script:ModelPickerUrl = "http://localhost:5080"
 # 127.0.0.1, not localhost: on Windows "localhost" tries IPv6 (::1) first, and Ollama listens only on IPv4,
 # so every new connection would wait ~2 s for the fallback.
 $script:OllamaUrl = "http://127.0.0.1:11434"
-$script:FakeCloudModel = "qwen3:1.7b"
-$script:ModeFile = Join-Path $env:TEMP "modelpicker-mode.txt"
+# The gateway runs hidden; its console output goes here instead of a second window.
+$script:GatewayLog = Join-Path $env:TEMP "modelpicker-gateway.log"
 
 function Test-ModelPickerUp {
     try { Invoke-RestMethod "$script:ModelPickerUrl/stats" -TimeoutSec 2 | Out-Null; $true } catch { $false }
@@ -43,8 +43,8 @@ function Complete-Progress-Dots([string]$Text, [Diagnostics.Stopwatch]$Stopwatch
 }
 
 function Get-ModelPickerModels {
-    # Models the gateway uses, read from appsettings.json, plus the FakeCloud model.
-    $models = @($script:FakeCloudModel)
+    # Models the gateway uses, read from appsettings.json and appsettings.Local.json.
+    $models = @()
     try {
         $cfg = Get-Content (Join-Path $script:ModelPickerProject "appsettings.json") -Raw -Encoding UTF8 | ConvertFrom-Json
         $models += $cfg.Gateway.Ollama.Model, $cfg.Gateway.Ollama.ClassifierModel
@@ -57,7 +57,7 @@ function Get-ModelPickerModels {
 }
 
 function Stop-ModelPickerGateway {
-    # Kills the process listening on 5080 plus the 'dotnet run' and gateway window that launched it.
+    # Kills the process listening on 5080 plus the 'dotnet run' that launched it.
     $conn = Get-NetTCPConnection -LocalPort 5080 -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1
     if (-not $conn) { return $false }
     $procId = $conn.OwningProcess
@@ -69,7 +69,7 @@ function Stop-ModelPickerGateway {
         Stop-Process -Id $procId -Force -ErrorAction SilentlyContinue
         $procId = $p.ParentProcessId
     }
-    # The gateway window started by 'modelpicker' (recognised by its title in the command line).
+    # A gateway window from older launcher versions (recognised by its title in the command line).
     Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue |
         Where-Object { $_.CommandLine -like "*ModelPicker gateway*" } |
         ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
@@ -80,7 +80,6 @@ function modelpicker-stop {
     # 1. Gateway
     $stopped = Stop-ModelPickerGateway
     if ($stopped) { Write-Host "Gateway zatrzymany." -ForegroundColor Cyan }
-    Remove-Item $script:ModeFile -ErrorAction SilentlyContinue
 
     # 2. Unload only ModelPicker's models (keep_alive = 0); other Ollama models stay untouched.
     # Repeated a few times: a model loaded with different options (e.g. classifier on CPU) may need a second pass.
@@ -104,6 +103,12 @@ function modelpicker-stop {
     if (-not $stopped -and $unloaded.Count -eq 0) {
         Write-Host "Nic do zwolnienia - gateway nie działał, modele nie były załadowane." -ForegroundColor DarkGray
     }
+}
+
+function Show-ModelPickerLog {
+    if (-not (Test-Path $script:GatewayLog)) { Write-Host "Brak logu - gateway nie był jeszcze uruchamiany ($script:GatewayLog)." -ForegroundColor DarkGray; return }
+    Write-Host "Log gatewaya ($script:GatewayLog), Ctrl+C kończy podgląd:" -ForegroundColor Cyan
+    Get-Content $script:GatewayLog -Encoding UTF8 -Tail 40 -Wait
 }
 
 function Test-OllamaUp {
@@ -170,14 +175,13 @@ function modelpicker {
         [string]$Command = "",
         [switch]$List,
         [string]$Key = "dev-key-jan",
-        [switch]$Real,
-        [switch]$FakeCloud,
         [switch]$Restart,
         [switch]$KeepRunning
     )
 
     if ($Command -eq "setup") { Invoke-ModelPickerSetup -List:$List; return }
-    if ($Command) { Write-Host "Nieznana komenda: $Command. Dostępne: modelpicker setup [-List]" -ForegroundColor Red; return }
+    if ($Command -eq "logs") { Show-ModelPickerLog; return }
+    if ($Command) { Write-Host "Nieznana komenda: $Command. Dostępne: modelpicker setup [-List], modelpicker logs" -ForegroundColor Red; return }
 
     # 0. Prerequisites
     if (-not (Get-Command dotnet -ErrorAction SilentlyContinue)) {
@@ -218,25 +222,23 @@ function modelpicker {
     }
 
     # 3. Gateway
-    if ($Real -and -not $env:ANTHROPIC_API_KEY -and -not [Environment]::GetEnvironmentVariable("ANTHROPIC_API_KEY", "User")) {
-        Write-Host "Brak ANTHROPIC_API_KEY. Ustaw go: [Environment]::SetEnvironmentVariable('ANTHROPIC_API_KEY','sk-ant-...','User') i otwórz nowe okno." -ForegroundColor Red
-        return
-    }
-    if ($Real -or $FakeCloud -or $Restart) { if (Stop-ModelPickerGateway) { Start-Sleep -Seconds 1 } }
+    if ($Restart) { if (Stop-ModelPickerGateway) { Start-Sleep -Seconds 1 } }
 
     if (-not (Test-ModelPickerUp)) {
-        $envName = if ($Real) { "Production" } else { "Development" }
-        $mode = if ($Real) { "PRAWDZIWY Claude" } elseif ($FakeCloud) { "chmura UDAWANA przez Ollamę ($script:FakeCloudModel)" } else { "chmura SYMULOWANA" }
-        $cloudEnv = if ($FakeCloud) { "`$env:Gateway__Cloud__Simulate = 'false'; `$env:Gateway__Cloud__BaseUrl = '$script:OllamaUrl'; `$env:Gateway__Cloud__Model = '$script:FakeCloudModel'; `$env:Gateway__Cloud__ApiKey = 'ollama'; " } else { "" }
-        Set-Content $script:ModeFile $mode -Encoding UTF8
-        Write-Host "Uruchamiam ModelPicker ($mode) w osobnym oknie..." -ForegroundColor Cyan
-        $cmd = "`$host.UI.RawUI.WindowTitle = 'ModelPicker gateway ($mode)'; `$env:ASPNETCORE_ENVIRONMENT = '$envName'; $cloudEnv Set-Location '$script:ModelPickerProject'; dotnet run --no-launch-profile"
-        Start-Process powershell -ArgumentList "-NoExit", "-ExecutionPolicy", "Bypass", "-Command", $cmd
+        # In the background, without a window; the log is in a file (modelpicker logs).
+        $gateway = Start-Process dotnet -ArgumentList "run", "--no-launch-profile" -WorkingDirectory $script:ModelPickerProject `
+            -WindowStyle Hidden -PassThru -RedirectStandardOutput $script:GatewayLog -RedirectStandardError "$script:GatewayLog.err"
 
         $sw = [Diagnostics.Stopwatch]::StartNew()
         $tick = 0
         while (-not (Test-ModelPickerUp)) {
-            if ($sw.Elapsed.TotalSeconds -gt 120) { Write-Host ""; Write-Host "Gateway nie wystartował w 2 min - sprawdź okno z logami." -ForegroundColor Red; return }
+            if ($gateway.HasExited -or $sw.Elapsed.TotalSeconds -gt 120) {
+                Write-Host ""
+                $why = if ($gateway.HasExited) { "zakończył się przy starcie" } else { "nie wystartował w 2 min" }
+                Write-Host "Gateway $why. Ostatnie linie logu ($script:GatewayLog):" -ForegroundColor Red
+                Get-Content $script:GatewayLog, "$script:GatewayLog.err" -Encoding UTF8 -ErrorAction SilentlyContinue | Select-Object -Last 20
+                return
+            }
             Write-Progress-Dots "Czekam na start gatewaya" ($tick++) $sw
             Start-Sleep -Seconds 1
         }
@@ -261,14 +263,11 @@ function modelpicker {
         }
     }
 
-    $running = if (Test-Path $script:ModeFile) { (Get-Content $script:ModeFile -Encoding UTF8 | Select-Object -First 1) } else { "nieznany" }
     Write-Host ""
-    Write-Host "Tryb chmury: $running" -ForegroundColor Yellow
-    Write-Host "Inne tryby (wpisz po wyjściu z czatu):" -ForegroundColor DarkGray
-    Write-Host "  modelpicker -FakeCloud   chmura przez Ollamę - prawdziwa ścieżka, za darmo" -ForegroundColor DarkGray
-    Write-Host "  modelpicker -Real        prawdziwy Claude (płatne, wymaga ANTHROPIC_API_KEY)" -ForegroundColor DarkGray
-    Write-Host "  modelpicker              chmura symulowana (domyślnie)" -ForegroundColor DarkGray
+    Write-Host "Zadania wycenione na chmurę zapytają o providera: Claude Code (claude) albo Codex (codex)." -ForegroundColor Yellow
+    Write-Host "Używany jest Twój login w danym CLI; jeśli go nie ma, pojawi się ekran logowania." -ForegroundColor DarkGray
     Write-Host "  -KeepRunning nie zwalnia pamięci po wyjściu; modelpicker-stop sprząta ręcznie" -ForegroundColor DarkGray
+    Write-Host "  Gateway działa w tle bez okna; jego log: modelpicker logs (w drugim oknie)" -ForegroundColor DarkGray
     Write-Host ""
 
     # 4. Chat; cleanup runs on /exit and on Ctrl+C.
@@ -284,3 +283,10 @@ function modelpicker {
         }
     }
 }
+
+# Short forms: "mp" = modelpicker, "mp-stop" = modelpicker-stop.
+# PowerShell already has "mp" as a built-in alias for Move-ItemProperty, and an alias wins over a function,
+# so that alias is removed first (only in this session; Move-ItemProperty itself keeps working).
+if (Test-Path Alias:mp) { Remove-Item Alias:mp -Force }
+Set-Alias -Name mp -Value modelpicker -Scope Global
+Set-Alias -Name mp-stop -Value modelpicker-stop -Scope Global

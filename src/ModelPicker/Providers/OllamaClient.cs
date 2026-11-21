@@ -52,12 +52,38 @@ public class OllamaClient(HttpClient http, IOptions<GatewayOptions> options, Har
             ["keep_alive"] = _opt.KeepAlive,
             // A JsonNode can belong to only one parent, so a shared schema must be copied per request.
             ["format"] = schema.DeepClone(),
-            ["options"] = new JsonObject { ["temperature"] = 0 },
+            ["options"] = ClassifierOptions(),
         };
-        if (_opt.ClassifierOnCpu) body["options"]!["num_gpu"] = 0;
         var json = await PostChatAsync(body, ct);
         var content = json["message"]?["content"]?.GetValue<string>();
         return content is null ? null : JsonNode.Parse(content);
+    }
+
+    /// <summary>
+    /// Loads a model into memory without generating anything (Ollama treats a generate request without a prompt
+    /// as "load"). Uses the same options as real requests: different ones (e.g. num_ctx, num_gpu) make Ollama reload.
+    /// </summary>
+    public async Task LoadAsync(bool classifier, CancellationToken ct)
+    {
+        var body = new JsonObject
+        {
+            ["model"] = classifier ? _opt.ClassifierModel : _opt.Model,
+            ["keep_alive"] = _opt.KeepAlive,
+            ["options"] = classifier ? ClassifierOptions() : BuildOptions(null, null),
+        };
+        using var response = await http.PostAsync(
+            $"{_opt.BaseUrl}/api/generate",
+            new StringContent(body.ToJsonString(), System.Text.Encoding.UTF8, "application/json"),
+            ct);
+        if (!response.IsSuccessStatusCode)
+            throw new HttpRequestException($"Ollama {(int)response.StatusCode}: {await response.Content.ReadAsStringAsync(ct)}");
+    }
+
+    private JsonObject ClassifierOptions()
+    {
+        var o = new JsonObject { ["temperature"] = 0 };
+        if (_opt.ClassifierOnCpu) o["num_gpu"] = 0;
+        return o;
     }
 
     private JsonObject BuildOptions(int? maxTokens, double? temperature)

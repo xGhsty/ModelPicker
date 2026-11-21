@@ -1,51 +1,71 @@
-using System.Text.Json.Nodes;
+using System.Diagnostics;
 using ModelPicker.Models;
 using ModelPicker.Providers;
 
 namespace ModelPicker.Routing;
 
 /// <summary>
-/// On startup, runs a short generation on the local model to measure this machine's speed
-/// (and load the model into GPU memory so the first real request is not slowed down).
+/// On startup, loads the local models into memory (so the first real request is not slowed down)
+/// and runs one short generation to measure this machine's speed.
 /// </summary>
 public class HardwareBenchmark(OllamaClient ollama, HardwareProfile hardware, ILogger<HardwareBenchmark> log) : BackgroundService
 {
+    // Enough for a stable tokens/s figure. Every real answer refines the measurement anyway,
+    // so a longer benchmark only delays startup: on a model split between GPU and CPU (~6 tok/s)
+    // each extra 100 tokens is ~15 s of waiting.
+    private const int MeasuredOutputTokens = 32;
+
     protected override async Task ExecuteAsync(CancellationToken ct)
     {
-        // A prompt of several hundred tokens: a tiny prompt makes prompt processing look much slower than it is.
-        var context = string.Concat(Enumerable.Repeat(
-            "A graphics processing unit is a specialized processor designed to accelerate parallel computations. ", 40));
-        var request = new ChatRequest
-        {
-            Messages = [new("user", context + "\n\nBased on the text above, write a short paragraph (about 100 words) explaining what a GPU is.")],
-            MaxTokens = 150,
-        };
-        try
-        {
-            // Twice: the first run includes model loading time, the second reflects steady-state speed.
-            await ollama.CompleteAsync(request, ct);
-            await ollama.CompleteAsync(request, ct);
-            log.LogInformation(
-                "Local hardware: prompt {Prompt:F0} tok/s, generation {Gen:F1} tok/s",
-                hardware.PromptTokensPerSecond, hardware.GenerationTokensPerSecond);
-        }
-        catch (Exception ex) when (ex is not OperationCanceledException)
-        {
-            log.LogWarning("Hardware benchmark failed ({Message}); using configured defaults", ex.Message);
-        }
+        var sw = Stopwatch.StartNew();
 
-        // Load the classifier too, otherwise the first real request pays for loading it.
-        try
+        // Loading only, no generation, so model loading time does not distort the measurement.
+        // Both at once: the classifier runs on the CPU, so it loads alongside the main model.
+        var main = Load(classifier: false);
+        var classifier = Load(classifier: true);
+        await Task.WhenAll(main, classifier);
+
+        if (await main)
         {
-            await ollama.ClassifyAsync("Respond with JSON.", "hi", JsonNode.Parse("{ \"type\": \"object\" }")!, ct);
-            log.LogInformation("Classifier model loaded");
-        }
-        catch (Exception ex) when (ex is not OperationCanceledException)
-        {
-            log.LogWarning("Classifier warm-up failed ({Message})", ex.Message);
+            // A prompt of several hundred tokens: a tiny prompt makes prompt processing look much slower than it is.
+            var context = string.Concat(Enumerable.Repeat(
+                "A graphics processing unit is a specialized processor designed to accelerate parallel computations. ", 40));
+            var request = new ChatRequest
+            {
+                Messages = [new("user", context + "\n\nBased on the text above, write a short paragraph (about 100 words) explaining what a GPU is.")],
+                MaxTokens = MeasuredOutputTokens,
+            };
+            try
+            {
+                await ollama.CompleteAsync(request, ct);
+                log.LogInformation(
+                    "Local hardware: prompt {Prompt:F0} tok/s, generation {Gen:F1} tok/s",
+                    hardware.PromptTokensPerSecond, hardware.GenerationTokensPerSecond);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                log.LogWarning("Hardware benchmark failed ({Message}); using configured defaults", ex.Message);
+            }
         }
 
         hardware.MarkWarmedUp();
-        log.LogInformation("Warm-up finished, ready for requests");
+        log.LogInformation("Warm-up finished in {Seconds:F1}s, ready for requests", sw.Elapsed.TotalSeconds);
+
+        async Task<bool> Load(bool classifier)
+        {
+            var name = classifier ? "Classifier" : "Main";
+            try
+            {
+                var loadSw = Stopwatch.StartNew();
+                await ollama.LoadAsync(classifier, ct);
+                log.LogInformation("{Name} model loaded in {Seconds:F1}s", name, loadSw.Elapsed.TotalSeconds);
+                return true;
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                log.LogWarning("{Name} model warm-up failed ({Message})", name, ex.Message);
+                return false;
+            }
+        }
     }
 }
