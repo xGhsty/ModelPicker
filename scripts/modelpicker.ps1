@@ -272,7 +272,9 @@ function modelpicker {
 
     # 4. Chat; cleanup runs on /exit and on Ctrl+C.
     try {
-        & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot "chat.ps1") -Key $Key -Url $script:ModelPickerUrl
+        # The folder "mp" was typed in: the cloud CLI runs there, so it knows that project.
+        $projectDir = (Get-Location -PSProvider FileSystem).ProviderPath
+        & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot "chat.ps1") -Key $Key -Url $script:ModelPickerUrl -ProjectDir $projectDir
     }
     finally {
         if ($KeepRunning) {

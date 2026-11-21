@@ -6,9 +6,12 @@
 # The gateway never calls a cloud API itself. When a task needs the cloud, it hands the (compressed)
 # conversation back here; you pick a provider (Claude Code, Codex) and its CLI runs on this computer
 # with your own login, exactly like typing "claude" or "codex" in a terminal. Not logged in = login screen.
+# It runs in the folder where you started the chat (-ProjectDir), so it knows that project: its CLAUDE.md,
+# memory and files (read-only).
 param(
     [string]$Key = "dev-key-jan",
-    [string]$Url = "http://localhost:5080"
+    [string]$Url = "http://localhost:5080",
+    [string]$ProjectDir = (Get-Location -PSProvider FileSystem).ProviderPath
 )
 
 [Console]::InputEncoding = [Text.Encoding]::UTF8
@@ -136,8 +139,8 @@ function Invoke-CloudProvider([string]$Id, [string]$Exe, [string]$Prompt, [Diagn
     $psi = New-Object Diagnostics.ProcessStartInfo
     $psi.FileName = $Exe
     $psi.Arguments = switch ($Id) {
-        # A chat answer, not an agent session: no tools, so nothing on this computer is read or changed.
-        "claude" { '-p --output-format json --tools ""' }
+        # Read-only tools: it can look through the project to answer, but cannot change files or run commands.
+        "claude" { '-p --output-format json --tools "Read,Grep,Glob"' }
         "codex"  { 'exec --json --skip-git-repo-check --sandbox read-only -' }
     }
     $psi.UseShellExecute = $false
@@ -146,11 +149,8 @@ function Invoke-CloudProvider([string]$Id, [string]$Exe, [string]$Prompt, [Diagn
     $psi.RedirectStandardError = $true
     $psi.StandardOutputEncoding = $utf8
     $psi.StandardErrorEncoding = $utf8
-    # A neutral folder: started in a project folder, Claude Code would load that project's CLAUDE.md
-    # and memory, and answer chat questions about "your project".
-    $workDir = Join-Path $env:TEMP "modelpicker-cloud"
-    if (-not (Test-Path $workDir)) { New-Item -ItemType Directory -Path $workDir -Force | Out-Null }
-    $psi.WorkingDirectory = $workDir
+    # The folder the chat was started in, like typing the CLI there: it loads that project's context.
+    $psi.WorkingDirectory = $ProjectDir
 
     $p = [Diagnostics.Process]::Start($psi)
     try {
@@ -470,6 +470,7 @@ if ($me) {
 } else {
     Write-Host "ModelPicker - gateway nie zna tego klucza, zapytania zostaną odrzucone (sprawdź Gateway:ApiKeys)." -ForegroundColor Red
 }
+Write-Host "Projekt: $ProjectDir (chmura widzi pliki tego katalogu, tylko do odczytu)" -ForegroundColor DarkCyan
 Write-Host "Komendy: /reset - nowa rozmowa, /stats - statystyki, /local /cloud /auto - wymuś routing, /exit - koniec" -ForegroundColor DarkCyan
 while ($true) {
     $q = Read-Host "`nTy [$mode]"
