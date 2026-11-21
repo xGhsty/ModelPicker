@@ -46,7 +46,7 @@ function Get-ErrorText($err) {
 
 # Sends the conversation to the gateway. Returns the local answer, a cloud handoff, or an error.
 function Send-Chat([string]$RouteMode, [Diagnostics.Stopwatch]$Stopwatch) {
-    $out = @{ Answer = $null; Final = $null; Handoff = $null; Failure = $null }
+    $out = @{ Answer = $null; Final = $null; Handoff = $null; Failure = $null; Usage = $null }
     $body = @{ model = $RouteMode; messages = $history; stream = $true } | ConvertTo-Json -Depth 4
     $waitLabel = "analizuję zadanie"
     try {
@@ -71,6 +71,7 @@ function Send-Chat([string]$RouteMode, [Diagnostics.Stopwatch]$Stopwatch) {
 
             if ($chunk.error) { $out.Failure = $chunk.error.message; break }
             if ($chunk.object -eq "modelpicker.cloud_handoff") { $out.Handoff = $chunk; continue }
+            if ($chunk.usage) { $out.Usage = $chunk.usage }  # the closing chunk
             if ($chunk.routing.phase -eq "decided") {
                 # The decision, shown as soon as it is made.
                 $rt = $chunk.routing
@@ -145,7 +146,11 @@ function Invoke-CloudProvider([string]$Id, [string]$Exe, [string]$Prompt, [Diagn
     $psi.RedirectStandardError = $true
     $psi.StandardOutputEncoding = $utf8
     $psi.StandardErrorEncoding = $utf8
-    $psi.WorkingDirectory = (Get-Location).Path
+    # A neutral folder: started in a project folder, Claude Code would load that project's CLAUDE.md
+    # and memory, and answer chat questions about "your project".
+    $workDir = Join-Path $env:TEMP "modelpicker-cloud"
+    if (-not (Test-Path $workDir)) { New-Item -ItemType Directory -Path $workDir -Force | Out-Null }
+    $psi.WorkingDirectory = $workDir
 
     $p = [Diagnostics.Process]::Start($psi)
     try {
@@ -324,6 +329,130 @@ function Show-Stats {
     }
 }
 
+# Models answer in markdown; printed raw it is full of #, ** and ``` marks. This renders the common parts
+# with console colours (no ANSI codes, so it also works in the old console): headings, bold, inline code,
+# code blocks, lists, quotes, rules and tables.
+$script:InlinePattern = '(`[^`]+`|\*\*[^*]+\*\*|__[^_]+__|\[[^\]]+\]\([^)\s]+\))'
+
+function Write-InlineParts([string]$Text, [ConsoleColor]$Color = "Gray") {
+    foreach ($part in [regex]::Split($Text, $script:InlinePattern)) {
+        if ($part -eq "") { continue }
+        if ($part -match '^`(.+)`$') { Write-Host $Matches[1] -NoNewline -ForegroundColor Yellow }
+        elseif ($part -match '^(\*\*|__)(.+)\1$') { Write-Host $Matches[2] -NoNewline -ForegroundColor White }
+        elseif ($part -match '^\[(.+)\]\((.+)\)$') {
+            Write-Host $Matches[1] -NoNewline -ForegroundColor $Color
+            Write-Host " ($($Matches[2]))" -NoNewline -ForegroundColor DarkGray
+        }
+        else {
+            # Single-asterisk italics cannot be shown in a console: just drop the marks.
+            Write-Host ([regex]::Replace($part, '(?<![\w*])\*(?=\S)([^*]+?)(?<=\S)\*(?![\w*])', '$1')) -NoNewline -ForegroundColor $Color
+        }
+    }
+}
+
+function Write-Inline([string]$Text, [ConsoleColor]$Color = "Gray") {
+    Write-InlineParts $Text $Color
+    Write-Host ""
+}
+
+# Length as displayed, i.e. without the inline marks.
+function Get-PlainLength([string]$Text) {
+    ([regex]::Replace($Text, '`([^`]+)`|\*\*([^*]+)\*\*|__([^_]+)__', '$1$2$3')).Length
+}
+
+function Write-MarkdownTable([string[]]$Rows) {
+    $cells = @(foreach ($r in $Rows) {
+        $t = $r.Trim()
+        if ($t -match '^\|?\s*:?-{2,}') { continue }  # the |---|---| separator row
+        , @($t.Trim('|').Split('|') | ForEach-Object { $_.Trim() })
+    })
+    if ($cells.Count -eq 0) { return }
+    $cols = ($cells | ForEach-Object { $_.Count } | Measure-Object -Maximum).Maximum
+    $widths = @(for ($c = 0; $c -lt $cols; $c++) {
+        ($cells | ForEach-Object { if ($c -lt $_.Count) { Get-PlainLength $_[$c] } else { 0 } } | Measure-Object -Maximum).Maximum
+    })
+    for ($r = 0; $r -lt $cells.Count; $r++) {
+        Write-Host "  " -NoNewline
+        for ($c = 0; $c -lt $cols; $c++) {
+            $cell = if ($c -lt $cells[$r].Count) { $cells[$r][$c] } else { "" }
+            $pad = " " * ($widths[$c] - (Get-PlainLength $cell))
+            if ($r -eq 0) { Write-Host ([regex]::Replace($cell, '`|\*\*|__', '') + $pad) -NoNewline -ForegroundColor Cyan }
+            else { Write-InlineParts $cell; Write-Host $pad -NoNewline }
+            if ($c -lt $cols - 1) { Write-Host "  │  " -NoNewline -ForegroundColor DarkGray }
+        }
+        Write-Host ""
+        if ($r -eq 0) { Write-Host ("  " + (($widths | ForEach-Object { "─" * $_ }) -join "──┼──")) -ForegroundColor DarkGray }
+    }
+}
+
+function Write-Markdown([string]$Text) {
+    $lines = @($Text -split "`r?`n")
+    $inCode = $false
+    $table = New-Object System.Collections.Generic.List[string]
+    for ($i = 0; $i -le $lines.Count; $i++) {
+        $line = if ($i -lt $lines.Count) { $lines[$i] } else { $null }
+
+        # A table ends at the first line that is not a table row.
+        if ($table.Count -gt 0 -and ($null -eq $line -or -not $line.TrimStart().StartsWith("|"))) {
+            Write-MarkdownTable $table.ToArray()
+            $table.Clear()
+        }
+        if ($null -eq $line) { break }
+
+        if ($line -match '^\s*(```|~~~)\s*(\S*)') {
+            if (-not $inCode) {
+                $lang = if ($Matches[2]) { $Matches[2] } else { "kod" }
+                Write-Host "  ┌─ $lang" -ForegroundColor DarkGray
+            } else {
+                Write-Host "  └─" -ForegroundColor DarkGray
+            }
+            $inCode = -not $inCode
+            continue
+        }
+        if ($inCode) {
+            Write-Host "  │ " -NoNewline -ForegroundColor DarkGray
+            Write-Host $line -ForegroundColor Yellow
+            continue
+        }
+        if ($line.TrimStart().StartsWith("|")) { $table.Add($line); continue }
+
+        # Closing hashes only after a space ("## Title ##"), so "C#" keeps its #.
+        if ($line -match '^(#{1,6})\s+(.*?)(\s+#+)?\s*$') {
+            $level = $Matches[1].Length
+            $title = [regex]::Replace($Matches[2], '`|\*\*|__', '')
+            if ($level -eq 1) {
+                Write-Host $title -ForegroundColor Cyan
+                Write-Host ("═" * $title.Length) -ForegroundColor DarkCyan
+            } elseif ($level -eq 2) {
+                Write-Host $title -ForegroundColor Cyan
+                Write-Host ("─" * $title.Length) -ForegroundColor DarkCyan
+            } else {
+                Write-Host $title -ForegroundColor DarkCyan
+            }
+        }
+        elseif ($line -match '^\s*([-*_])(\s*\1){2,}\s*$') {
+            $width = try { [Math]::Min([Console]::WindowWidth - 1, 60) } catch { 60 }
+            Write-Host ("─" * $width) -ForegroundColor DarkGray
+        }
+        elseif ($line -match '^(\s*)[-*+]\s+(.*)$') {
+            Write-Host ("  " + $Matches[1] + "• ") -NoNewline -ForegroundColor Cyan
+            Write-Inline $Matches[2]
+        }
+        elseif ($line -match '^(\s*)(\d+)[.)]\s+(.*)$') {
+            Write-Host ("  " + $Matches[1] + $Matches[2] + ". ") -NoNewline -ForegroundColor Cyan
+            Write-Inline $Matches[3]
+        }
+        elseif ($line -match '^\s*>\s?(.*)$') {
+            Write-Host "  ┃ " -NoNewline -ForegroundColor DarkGray
+            Write-Inline $Matches[1] DarkGray
+        }
+        else {
+            Write-Inline $line
+        }
+    }
+    if ($inCode) { Write-Host "  └─" -ForegroundColor DarkGray }  # an unclosed block (e.g. a cut-off answer)
+}
+
 function Show-Compression($Routing) {
     if ($Routing.compression) {
         $c = $Routing.compression
@@ -378,8 +507,9 @@ while ($true) {
             }
             $answer = $cloud.Content
             $remaining = Send-CloudUsage $choice $cloud
-            Write-Host ("[gotowe] {0}, odpowiedź po {1:F1}s, tokeny: {2} wej. / {3} wyj." -f $cloud.Model, $sw.Elapsed.TotalSeconds, $cloud.InputTokens, $cloud.OutputTokens) -ForegroundColor Magenta
-            if ($null -ne $remaining) { Write-Host "Pozostały miesięczny budżet chmury: $remaining tokenów" -ForegroundColor DarkGray }
+            $footer = "{0} · {1:F1} s · {2:N0} wej. / {3:N0} wyj. tokenów" -f $cloud.Model, $sw.Elapsed.TotalSeconds, $cloud.InputTokens, $cloud.OutputTokens
+            if ($null -ne $remaining) { $footer += " · budżet chmury: zostało {0:N0}" -f $remaining }
+            $footerColor = "Magenta"
             $res = $null
             break
         }
@@ -392,10 +522,15 @@ while ($true) {
             continue
         }
         $answer = $res.Answer
-        Write-Host ("[gotowe] {0}, odpowiedź po {1:F1}s" -f $res.Final.model, $sw.Elapsed.TotalSeconds) -ForegroundColor Green
+        $footer = "{0} (lokalnie) · {1:F1} s" -f $res.Final.model, $sw.Elapsed.TotalSeconds
+        if ($res.Usage) { $footer += " · {0:N0} wej. / {1:N0} wyj. tokenów" -f $res.Usage.prompt_tokens, $res.Usage.completion_tokens }
+        $footerColor = "Green"
     }
     $sw.Stop()
 
     [void]$history.Add(@{ role = "assistant"; content = $answer })
-    Write-Host "`nModel: $answer"
+    Write-Host ""
+    Write-Markdown $answer
+    Write-Host ""
+    Write-Host "-- $footer" -ForegroundColor $footerColor
 }
